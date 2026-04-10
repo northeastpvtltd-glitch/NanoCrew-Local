@@ -1,0 +1,17 @@
+# NanoCrew-Local Dependencies
+# Kept ultra-light for constrained hardware deployments.
+
+# Telegram bot framework (v21+ async Application pattern).
+# Brings in httpx as a transitive dependency — which we also use
+# directly for Ollama REST API calls.
+python-telegram-bot>=21.0,<23.0
+
+# Load .env configuration without cluttering the environment.
+python-dotenv>=1.0.0
+
+# System metrics: RAM, CPU, network — used by hardware-awareness
+# checks and available to agent-generated analysis.
+psutil>=5.9.0
+
+# YAML parsing for crew definition files in crews/*.yaml.
+pyyaml>=6.0

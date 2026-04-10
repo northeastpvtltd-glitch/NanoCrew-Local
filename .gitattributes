@@ -1,0 +1,12 @@
+# ============================================================
+# NanoCrew-Local — Git line ending normalization
+# Ensures consistent LF in the repo regardless of the
+# contributor's OS.  Git auto-converts on checkout.
+# ============================================================
+
+* text=auto eol=lf
+
+# Force binary treatment for files that must not be line-converted.
+*.png binary
+*.jpg binary
+*.ico binary
