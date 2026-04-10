@@ -17,21 +17,21 @@
 
 **NanoCrew-Local** lets any user build any type of AI-powered company — a startup, a marketing agency, a law firm, a support center, a security ops team, a content studio — and run it entirely on the hardware they already own.
 
-A **crew** is a YAML file. An **agent** is an employee: a job title, a role, and a system prompt that *is* their brain. Work flows down the org chart — each agent's output becomes the next agent's input. Send a task via Telegram; your company handles it locally. Nothing leaves your machine.
+A **crew** is a YAML file. An **agent** is an employee: a job title, a role, and a system prompt that _is_ their brain. Work flows down the org chart — each agent's output becomes the next agent's input. Send a task via Telegram; your company handles it locally. Nothing leaves your machine.
 
 ```yaml
 # example: a 3-person content studio
 name: "Content Studio"
 agents:
-  - name: "Brief Writer"    # receives your raw idea
+  - name: "Brief Writer" # receives your raw idea
     role: "Turn a topic into a detailed content brief"
     system_prompt: "You are a senior content strategist..."
     temperature: 0.5
-  - name: "Copywriter"      # receives the brief
+  - name: "Copywriter" # receives the brief
     role: "Write a first draft from the brief"
     system_prompt: "You are a professional copywriter..."
     temperature: 0.7
-  - name: "Editor"          # receives the draft
+  - name: "Editor" # receives the draft
     role: "Polish the copy and prepare it for publishing"
     system_prompt: "You are a meticulous editor..."
     temperature: 0.3
@@ -41,7 +41,7 @@ This is the entire mental model. The rest is plumbing.
 
 ### Philosophy
 
-Inspired by Karpathy's **nanoGPT** — *"the simplest, fastest repository… plain and readable, very easy to hack to your needs"*:
+Inspired by Karpathy's **nanoGPT** — _"the simplest, fastest repository… plain and readable, very easy to hack to your needs"_:
 
 - **One file** — all logic in `core_orchestrator.py`. No package to install; just clone and run.
 - **YAML = org chart** — no code required to define a new company or add employees
@@ -51,18 +51,18 @@ Inspired by Karpathy's **nanoGPT** — *"the simplest, fastest repository… pla
 
 ### Any Company. Any Industry.
 
-| Company Type       | Example Pipeline                                              |
-| ------------------ | ------------------------------------------------------------- |
-| Tech Startup       | CEO Adviser → Developer → Product Writer                      |
-| Marketing Agency   | Strategist → Copywriter → Analytics Reporter                  |
-| Customer Support   | Triage Agent → Resolver → Escalation Manager                  |
-| Legal Firm         | Intake → Researcher → Brief Writer                            |
-| Security Ops       | Analyst → Engineer → Reporter *(ships by default)*            |
-| Content Studio     | Brief Writer → Copywriter → Editor                            |
-| Finance Team       | Data Collector → Analyst → CFO Summary                        |
-| HR Department      | Screener → Interview Planner → Offer Writer                   |
-| E-Commerce         | Product Researcher → Listing Writer → SEO Reviewer            |
-| Healthcare Admin   | Intake → Clinical Advisor → Documentation Specialist          |
+| Company Type     | Example Pipeline                                     |
+| ---------------- | ---------------------------------------------------- |
+| Tech Startup     | CEO Adviser → Developer → Product Writer             |
+| Marketing Agency | Strategist → Copywriter → Analytics Reporter         |
+| Customer Support | Triage Agent → Resolver → Escalation Manager         |
+| Legal Firm       | Intake → Researcher → Brief Writer                   |
+| Security Ops     | Analyst → Engineer → Reporter _(ships by default)_   |
+| Content Studio   | Brief Writer → Copywriter → Editor                   |
+| Finance Team     | Data Collector → Analyst → CFO Summary               |
+| HR Department    | Screener → Interview Planner → Offer Writer          |
+| E-Commerce       | Product Researcher → Listing Writer → SEO Reviewer   |
+| Healthcare Admin | Intake → Clinical Advisor → Documentation Specialist |
 
 Drop a YAML file in `crews/` and your new company is live on the next bot restart.
 

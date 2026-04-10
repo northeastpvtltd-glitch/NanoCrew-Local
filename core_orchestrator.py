@@ -71,14 +71,101 @@ COMMAND_TIMEOUT: int = int(os.getenv("COMMAND_TIMEOUT", "30"))
 LOG_LEVEL: str = os.getenv("LOG_LEVEL", "INFO")
 
 # ============================================================
-# Logging
+# Poor Man's Configurator — inspired by nanoGPT/configurator.py
+# ============================================================
+# Override any of the above config globals from the command line:
+#   python core_orchestrator.py --OLLAMA_MODEL=llama3:8b --COMMAND_TIMEOUT=60
+# Type is preserved: if the original is int, the override is cast to int.
+
+def _apply_cli_overrides() -> None:
+    """Parse --key=value args and override matching module globals."""
+    from ast import literal_eval
+    g = globals()
+    for arg in sys.argv[1:]:
+        if not arg.startswith("--") or "=" not in arg:
+            continue
+        key, val = arg.split("=", 1)
+        key = key.lstrip("-")
+        if key not in g:
+            continue
+        current = g[key]
+        try:
+            attempt = literal_eval(val)
+        except (SyntaxError, ValueError):
+            attempt = val
+        # Coerce to the original type when possible.
+        if isinstance(current, bool):
+            attempt = str(attempt).lower() in ("true", "1", "yes")
+        elif isinstance(current, int) and not isinstance(attempt, int):
+            attempt = int(attempt)
+        elif isinstance(current, float) and not isinstance(attempt, float):
+            attempt = float(attempt)
+        g[key] = attempt
+
+
+_apply_cli_overrides()
+
+# ============================================================
+# Logging — colored output inspired by nanochat/common.py
 # ============================================================
 
-logging.basicConfig(
-    format="%(asctime)s [%(name)s] %(levelname)s: %(message)s",
-    level=getattr(logging, LOG_LEVEL.upper(), logging.INFO),
-)
-logger = logging.getLogger("nanocrew")
+class _ColoredFormatter(logging.Formatter):
+    """ANSI-colored log formatter.  Bold level names, highlighted numbers."""
+    _COLORS = {
+        "DEBUG": "\033[36m",     # Cyan
+        "INFO": "\033[32m",      # Green
+        "WARNING": "\033[33m",   # Yellow
+        "ERROR": "\033[31m",     # Red
+        "CRITICAL": "\033[35m",  # Magenta
+    }
+    _RESET = "\033[0m"
+    _BOLD = "\033[1m"
+
+    def format(self, record: logging.LogRecord) -> str:
+        color = self._COLORS.get(record.levelname, "")
+        if color:
+            record.levelname = f"{color}{self._BOLD}{record.levelname}{self._RESET}"
+        msg = super().format(record)
+        # Highlight numbers with units (e.g. "4.2 GB", "83%", "3 agents")
+        if record.levelno == logging.INFO:
+            msg = re.sub(
+                r'(\d+\.?\d*\s*(?:GB|MB|KB|%|agents?|crews?|commands?|chars?|s)\b)',
+                rf'{self._BOLD}\1{self._RESET}',
+                msg,
+            )
+        return msg
+
+
+def _setup_logging() -> logging.Logger:
+    handler = logging.StreamHandler()
+    handler.setFormatter(_ColoredFormatter("%(asctime)s [%(name)s] %(levelname)s: %(message)s"))
+    root = logging.getLogger()
+    root.setLevel(getattr(logging, LOG_LEVEL.upper(), logging.INFO))
+    root.addHandler(handler)
+    return logging.getLogger("nanocrew")
+
+
+logger = _setup_logging()
+
+
+# ============================================================
+# Startup banner — inspired by nanoGPT / nanochat
+# ============================================================
+
+_BANNER = r"""
+  _   _                    ____                   
+ | \ | | __ _ _ __   ___  / ___|_ __ _____      __
+ |  \| |/ _` | '_ \ / _ \| |   | '__/ _ \ \ /\ / /
+ | |\  | (_| | | | | (_) | |___| | |  __/\ V  V / 
+ |_| \_|\__,_|_| |_|\___/ \____|_|  \___| \_/\_/  
+        Your AI workforce, running locally.
+"""
+
+
+def _print_banner() -> None:
+    """Print the startup banner (only when stdout is a TTY)."""
+    if sys.stdout.isatty():
+        print(_BANNER)
 
 # ============================================================
 # Hardware-awareness constants
@@ -125,6 +212,21 @@ _PATH_TRAVERSAL = re.compile(r'(^|[\\/])\.\.([\\/]|$)')
 # ============================================================
 # Data Classes
 # ============================================================
+
+@dataclass
+class ExecutionResult:
+    """Structured result of a sandboxed command execution."""
+    command: str
+    stdout: str = ""
+    stderr: str = ""
+    returncode: int = -1
+    error: str | None = None
+    timeout: bool = False
+
+    @property
+    def success(self) -> bool:
+        return self.error is None and self.returncode == 0
+
 
 @dataclass
 class AgentProfile:
@@ -376,13 +478,10 @@ class CommandExecutor:
 
         return None  # Safe.
 
-    async def execute(self, tokens: list[str]) -> dict:
+    async def execute(self, tokens: list[str]) -> ExecutionResult:
         """
         Execute a single validated command in a sandboxed subprocess.
-
-        Returns a dict:
-            {"command": "...", "stdout": "...", "stderr": "...",
-             "returncode": int, "error": str | None}
+        Returns an ExecutionResult with structured fields.
         """
         cmd_str = " ".join(tokens)
 
@@ -390,13 +489,7 @@ class CommandExecutor:
         rejection = self.validate_command(tokens)
         if rejection:
             logger.warning("Command BLOCKED: %s — %s", cmd_str, rejection)
-            return {
-                "command": cmd_str,
-                "stdout": "",
-                "stderr": "",
-                "returncode": -1,
-                "error": f"Blocked: {rejection}",
-            }
+            return ExecutionResult(command=cmd_str, error=f"Blocked: {rejection}")
 
         logger.info("Executing command: %s", cmd_str)
 
@@ -420,13 +513,11 @@ class CommandExecutor:
                     proc.kill()
                     await proc.wait()
                     logger.warning("Command timed out after %ds: %s", self._timeout, cmd_str)
-                    return {
-                        "command": cmd_str,
-                        "stdout": "",
-                        "stderr": "",
-                        "returncode": -1,
-                        "error": f"Timed out after {self._timeout}s",
-                    }
+                    return ExecutionResult(
+                        command=cmd_str,
+                        error=f"Timed out after {self._timeout}s",
+                        timeout=True,
+                    )
 
             # Cap output size.
             stdout = stdout_bytes.decode("utf-8", errors="replace")[:self._output_limit]
@@ -442,40 +533,28 @@ class CommandExecutor:
                 cmd_str, proc.returncode, len(stdout), len(stderr),
             )
 
-            return {
-                "command": cmd_str,
-                "stdout": stdout,
-                "stderr": stderr,
-                "returncode": proc.returncode,
-                "error": None,
-            }
+            return ExecutionResult(
+                command=cmd_str,
+                stdout=stdout,
+                stderr=stderr,
+                returncode=proc.returncode,
+            )
 
         except FileNotFoundError:
             logger.warning("Command not found on system: %s", tokens[0])
-            return {
-                "command": cmd_str,
-                "stdout": "",
-                "stderr": "",
-                "returncode": -1,
-                "error": f"Command not found: {tokens[0]}",
-            }
+            return ExecutionResult(command=cmd_str, error=f"Command not found: {tokens[0]}")
         except Exception as exc:
             logger.exception("Unexpected error executing: %s", cmd_str)
-            return {
-                "command": cmd_str,
-                "stdout": "",
-                "stderr": "",
-                "returncode": -1,
-                "error": str(exc),
-            }
+            return ExecutionResult(command=cmd_str, error=str(exc))
 
     async def run_from_llm_output(self, llm_output: str) -> str:
         """
         Extract commands from LLM output, validate and execute each one
         sequentially, and return a formatted report of all results.
 
-        This is the main entry point called by PipelineEngine when an
-        agent has can_execute=True.
+        Uses structured delimiters so downstream agents can reliably
+        parse where system output starts and ends — inspired by
+        nanochat's <|output_start|>/<|output_end|> pattern.
         """
         commands = self.extract_commands(llm_output)
 
@@ -487,15 +566,15 @@ class CommandExecutor:
         for tokens in commands:
             result = await self.execute(tokens)
 
-            parts = [f"$ {result['command']}"]
-            if result["error"]:
-                parts.append(f"ERROR: {result['error']}")
+            parts = [f"$ {result.command}"]
+            if result.error:
+                parts.append(f"ERROR: {result.error}")
             else:
-                if result["stdout"]:
-                    parts.append(result["stdout"])
-                if result["stderr"]:
-                    parts.append(f"STDERR: {result['stderr']}")
-                parts.append(f"(exit code: {result['returncode']})")
+                if result.stdout:
+                    parts.append(result.stdout)
+                if result.stderr:
+                    parts.append(f"STDERR: {result.stderr}")
+                parts.append(f"(exit code: {result.returncode})")
 
             results.append("\n".join(parts))
 
@@ -584,9 +663,9 @@ class PipelineEngine:
                 if exec_report:
                     output = (
                         f"{output}\n\n"
-                        f"=== LIVE SYSTEM OUTPUT ===\n"
+                        f"<|system_output_start|>\n"
                         f"{exec_report}\n"
-                        f"=== END SYSTEM OUTPUT ==="
+                        f"<|system_output_end|>"
                     )
 
             steps.append({"agent": agent.name, "output": output})
@@ -1005,6 +1084,13 @@ def main() -> None:
         5. Build the Telegram Application and start polling.
     """
     global llm, engine, executor, crew_registry
+
+    _print_banner()
+
+    # Log any CLI overrides that were applied.
+    for arg in sys.argv[1:]:
+        if arg.startswith("--") and "=" in arg:
+            logger.info("CLI override: %s", arg)
 
     # --- Validate config ---
     if not TELEGRAM_BOT_TOKEN:
