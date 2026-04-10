@@ -89,6 +89,12 @@ ENABLE_CODE_AGENT: bool = os.getenv("ENABLE_CODE_AGENT", "false").lower() in ("t
 CODE_AGENT_MAX_ITERATIONS: int = int(os.getenv("CODE_AGENT_MAX_ITERATIONS", "5"))
 CODE_AGENT_TIMEOUT: int = int(os.getenv("CODE_AGENT_TIMEOUT", "60"))
 
+# ---- OpenClaw Integration ----
+ENABLE_OPENCLAW: bool = os.getenv("ENABLE_OPENCLAW", "false").lower() in ("true", "1", "yes")
+OPENCLAW_GATEWAY_URL: str = os.getenv("OPENCLAW_GATEWAY_URL", "ws://127.0.0.1:18789")
+OPENCLAW_API_TOKEN: str = os.getenv("OPENCLAW_API_TOKEN", "")
+OPENCLAW_DEFAULT_CREW: str = os.getenv("OPENCLAW_DEFAULT_CREW", "")  # crew key to use for inbound messages
+
 # ============================================================
 # Poor Man's Configurator — inspired by nanoGPT/configurator.py
 # ============================================================
@@ -1292,6 +1298,7 @@ class DashboardServer:
         self._app.router.add_get("/api/status", self._handle_status)
         self._app.router.add_get("/api/crews", self._handle_crews)
         self._app.router.add_post("/api/suggest", self._handle_suggest)
+        self._app.router.add_post("/api/crew/run", self._handle_crew_run)
         self._runner: web.AppRunner | None = None
         self._metrics_task: asyncio.Task | None = None
 
@@ -1363,6 +1370,8 @@ class DashboardServer:
             "llm_busy": llm._lock.locked(),
             "code_execution": ENABLE_CODE_EXECUTION,
             "code_agent": ENABLE_CODE_AGENT,
+            "openclaw_enabled": ENABLE_OPENCLAW,
+            "openclaw_connected": openclaw_connector.connected if openclaw_connector else False,
             "cpu_percent": psutil.cpu_percent(interval=0),
             "ram_total_gb": round(mem.total / (1024**3), 1),
             "ram_used_gb": round(mem.used / (1024**3), 1),
@@ -1440,8 +1449,337 @@ class DashboardServer:
                 status=500,
             )
 
+    async def _handle_crew_run(self, request: web.Request) -> web.Response:
+        """
+        REST API endpoint: run a crew pipeline and return results.
+
+        POST /api/crew/run
+        Body: {"crew": "dev_team", "instruction": "write a fibonacci function"}
+
+        This is the primary integration point for OpenClaw skills and
+        any external tool that wants to trigger NanoCrew pipelines.
+        """
+        try:
+            body = await request.json()
+        except Exception:
+            return web.json_response(
+                {"error": "Invalid JSON body"}, status=400
+            )
+
+        crew_key = body.get("crew", "").strip().lower()
+        instruction = body.get("instruction", "").strip()
+
+        if not instruction:
+            return web.json_response(
+                {"error": "Missing 'instruction' field"}, status=400
+            )
+
+        # Resolve crew — use specified, fallback to first available.
+        if crew_key:
+            target_crew = crew_registry.get(crew_key)
+            if not target_crew:
+                available = list(crew_registry.keys())
+                return web.json_response(
+                    {"error": f"Unknown crew: {crew_key}", "available": available},
+                    status=404,
+                )
+        elif crew_registry:
+            target_crew = next(iter(crew_registry.values()))
+            crew_key = next(iter(crew_registry.keys()))
+        else:
+            return web.json_response(
+                {"error": "No crews loaded"}, status=503
+            )
+
+        logger.info("API crew run: crew='%s', instruction='%s'", crew_key, instruction[:100])
+
+        try:
+            steps = await engine.run(target_crew, instruction)
+            results = [
+                {"agent": s["agent"], "output": s["output"]}
+                for s in steps
+            ]
+            return web.json_response({
+                "crew": crew_key,
+                "crew_name": target_crew.name,
+                "agents_run": len(results),
+                "results": results,
+            })
+        except Exception as exc:
+            logger.exception("API crew run failed")
+            return web.json_response(
+                {"error": f"Pipeline error: {exc}"}, status=500
+            )
+
 
 dashboard_server: DashboardServer | None = None
+
+
+# ============================================================
+# OpenClaw Gateway Connector — bidirectional integration
+# ============================================================
+
+class OpenClawConnector:
+    """
+    Bidirectional bridge between NanoCrew-Local and OpenClaw.
+
+    **Inbound (OpenClaw → NanoCrew):**
+      Connects to the OpenClaw Gateway WebSocket, listens for
+      messages routed to NanoCrew, executes them through the crew
+      pipeline, and sends the result back.
+
+    **Outbound (NanoCrew → OpenClaw):**
+      Provides send_message() for NanoCrew to push messages into
+      any OpenClaw session.
+
+    Protocol reference: https://docs.openclaw.ai/concepts/architecture
+    """
+
+    def __init__(
+        self,
+        gateway_url: str,
+        api_token: str,
+        default_crew: str = "",
+    ) -> None:
+        self._gateway_url = gateway_url
+        self._api_token = api_token
+        self._default_crew = default_crew
+        self._ws: web.WebSocketResponse | None = None
+        self._session: httpx.AsyncClient | None = None
+        self._task: asyncio.Task | None = None
+        self._connected = False
+
+    async def start(self) -> None:
+        """Connect to the OpenClaw Gateway and start listening."""
+        self._task = asyncio.create_task(self._connection_loop())
+        logger.info("OpenClaw connector starting → %s", self._gateway_url)
+
+    async def stop(self) -> None:
+        """Disconnect and clean up."""
+        if self._task:
+            self._task.cancel()
+            try:
+                await self._task
+            except asyncio.CancelledError:
+                pass
+        if self._session:
+            await self._session.aclose()
+        self._connected = False
+        logger.info("OpenClaw connector stopped")
+
+    @property
+    def connected(self) -> bool:
+        return self._connected
+
+    async def _connection_loop(self) -> None:
+        """
+        Persistent connection loop with auto-reconnect.
+        Uses aiohttp ClientSession for WebSocket client.
+        """
+        import aiohttp
+
+        retry_delay = 5  # seconds between reconnect attempts
+
+        while True:
+            try:
+                async with aiohttp.ClientSession() as session:
+                    headers = {}
+                    if self._api_token:
+                        headers["Authorization"] = f"Bearer {self._api_token}"
+
+                    logger.info("Connecting to OpenClaw Gateway at %s", self._gateway_url)
+
+                    async with session.ws_connect(
+                        self._gateway_url,
+                        headers=headers,
+                        heartbeat=30,
+                    ) as ws:
+                        self._connected = True
+                        logger.info("Connected to OpenClaw Gateway")
+
+                        await event_bus.publish({
+                            "type": "openclaw_connected",
+                            "gateway": self._gateway_url,
+                        })
+
+                        async for msg in ws:
+                            if msg.type == aiohttp.WSMsgType.TEXT:
+                                await self._handle_message(ws, msg.data)
+                            elif msg.type == aiohttp.WSMsgType.ERROR:
+                                logger.warning(
+                                    "OpenClaw WS error: %s", ws.exception()
+                                )
+                                break
+
+            except asyncio.CancelledError:
+                logger.info("OpenClaw connector cancelled")
+                return
+            except Exception as exc:
+                logger.warning(
+                    "OpenClaw connection failed: %s — retrying in %ds",
+                    exc, retry_delay,
+                )
+
+            self._connected = False
+            await event_bus.publish({"type": "openclaw_disconnected"})
+
+            try:
+                await asyncio.sleep(retry_delay)
+            except asyncio.CancelledError:
+                return
+
+    async def _handle_message(self, ws, raw: str) -> None:
+        """
+        Process an inbound message from OpenClaw.
+
+        Expected format (simplified OpenClaw agent protocol):
+        {
+            "method": "agent.message",
+            "params": {
+                "sessionId": "...",
+                "message": "the user instruction",
+                "crew": "optional_crew_key"
+            },
+            "id": "request_id"
+        }
+
+        We also handle a simple text format for lightweight integration:
+        {"text": "instruction", "crew": "crew_key"}
+        """
+        try:
+            data = json.loads(raw)
+        except json.JSONDecodeError:
+            logger.warning("OpenClaw: non-JSON message ignored")
+            return
+
+        # --- Standard OpenClaw RPC format ---
+        if data.get("method") == "agent.message":
+            params = data.get("params", {})
+            instruction = params.get("message", "").strip()
+            crew_key = params.get("crew", self._default_crew).strip().lower()
+            session_id = params.get("sessionId", "")
+            request_id = data.get("id")
+
+        # --- Simple format for easy integration ---
+        elif "text" in data:
+            instruction = data["text"].strip()
+            crew_key = data.get("crew", self._default_crew).strip().lower()
+            session_id = data.get("sessionId", "")
+            request_id = data.get("id")
+
+        else:
+            # Not a message we handle — ignore (could be heartbeat, etc.)
+            return
+
+        if not instruction:
+            return
+
+        # Resolve crew.
+        target_crew = crew_registry.get(crew_key) if crew_key else None
+        if not target_crew and crew_registry:
+            target_crew = next(iter(crew_registry.values()))
+            crew_key = next(iter(crew_registry.keys()))
+
+        if not target_crew:
+            await self._send_response(ws, request_id, session_id, {
+                "error": "No crews loaded in NanoCrew-Local",
+            })
+            return
+
+        logger.info(
+            "OpenClaw task: crew='%s', instruction='%s'",
+            crew_key, instruction[:100],
+        )
+
+        await event_bus.publish({
+            "type": "openclaw_task_start",
+            "crew": crew_key,
+            "instruction": instruction[:200],
+        })
+
+        try:
+            steps = await engine.run(target_crew, instruction)
+            # Return the final agent's output as the primary response,
+            # with full pipeline results in metadata.
+            final_output = steps[-1]["output"] if steps else ""
+
+            result = {
+                "crew": crew_key,
+                "crew_name": target_crew.name,
+                "response": final_output,
+                "pipeline": [
+                    {"agent": s["agent"], "output": s["output"]}
+                    for s in steps
+                ],
+            }
+        except Exception as exc:
+            logger.exception("OpenClaw pipeline error")
+            result = {"error": f"Pipeline error: {exc}"}
+
+        await self._send_response(ws, request_id, session_id, result)
+
+        await event_bus.publish({
+            "type": "openclaw_task_done",
+            "crew": crew_key,
+            "success": "error" not in result,
+        })
+
+    async def _send_response(
+        self, ws, request_id: str | None, session_id: str, result: dict
+    ) -> None:
+        """Send a response back to OpenClaw."""
+        response: dict = {"result": result}
+        if request_id:
+            response["id"] = request_id
+        if session_id:
+            response["sessionId"] = session_id
+
+        try:
+            await ws.send_json(response)
+        except Exception as exc:
+            logger.warning("Failed to send OpenClaw response: %s", exc)
+
+    async def send_message(
+        self, session_id: str, message: str
+    ) -> bool:
+        """
+        Outbound: push a message into an OpenClaw session.
+
+        Uses the OpenClaw REST API (HTTP POST) rather than the WS
+        to avoid protocol coupling.
+        """
+        if not self._api_token:
+            logger.warning("Cannot send to OpenClaw: no API token configured")
+            return False
+
+        # Parse base URL from WS URL for REST calls.
+        base_url = self._gateway_url.replace("ws://", "http://").replace("wss://", "https://")
+        # Strip trailing path/port query if needed.
+        if base_url.endswith("/"):
+            base_url = base_url.rstrip("/")
+
+        try:
+            async with httpx.AsyncClient(timeout=30) as client:
+                resp = await client.post(
+                    f"{base_url}/api/sessions/{session_id}/messages",
+                    json={"message": message},
+                    headers={"Authorization": f"Bearer {self._api_token}"},
+                )
+                if resp.status_code < 300:
+                    logger.info("Sent message to OpenClaw session %s", session_id)
+                    return True
+                else:
+                    logger.warning(
+                        "OpenClaw API returned %d: %s",
+                        resp.status_code, resp.text[:200],
+                    )
+                    return False
+        except Exception as exc:
+            logger.warning("Failed to send to OpenClaw: %s", exc)
+            return False
+
+
+openclaw_connector: OpenClawConnector | None = None
 
 
 # ============================================================
@@ -1526,6 +1864,7 @@ async def cmd_status(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
         f"LLM Lock: {lock_status}",
         f"Code execution: {'ENABLED' if ENABLE_CODE_EXECUTION else 'DISABLED'}",
         f"Code agent: {'ENABLED' if ENABLE_CODE_AGENT else 'DISABLED'}",
+        f"OpenClaw: {'CONNECTED' if (openclaw_connector and openclaw_connector.connected) else 'ENABLED (disconnected)' if ENABLE_OPENCLAW else 'DISABLED'}",
         f"RAM: {available_gb:.1f} / {total_gb:.1f} GB available",
         f"RAM usage: {mem.percent}%",
         f"CPU: {psutil.cpu_percent(interval=0.5)}%",
@@ -1747,7 +2086,7 @@ def main() -> None:
         4. Log a hardware report.
         5. Build the Telegram Application and start polling.
     """
-    global llm, engine, executor, code_executor, crew_registry, dashboard_server
+    global llm, engine, executor, code_executor, crew_registry, dashboard_server, openclaw_connector
 
     _print_banner()
 
@@ -1822,10 +2161,26 @@ def main() -> None:
     # --- Start the dashboard web server ---
     dashboard_server = DashboardServer(DASHBOARD_HOST, DASHBOARD_PORT)
 
+    # --- OpenClaw connector (opt-in) ---
+    if ENABLE_OPENCLAW:
+        openclaw_connector = OpenClawConnector(
+            gateway_url=OPENCLAW_GATEWAY_URL,
+            api_token=OPENCLAW_API_TOKEN,
+            default_crew=OPENCLAW_DEFAULT_CREW,
+        )
+        logger.info("OpenClaw integration ENABLED → %s", OPENCLAW_GATEWAY_URL)
+    else:
+        openclaw_connector = None
+        logger.info("OpenClaw integration DISABLED (set ENABLE_OPENCLAW=true to enable)")
+
     async def post_init(application) -> None:
         await dashboard_server.start()
+        if openclaw_connector:
+            await openclaw_connector.start()
 
     async def post_shutdown(application) -> None:
+        if openclaw_connector:
+            await openclaw_connector.stop()
         await dashboard_server.stop()
 
     app.post_init = post_init
@@ -1833,8 +2188,9 @@ def main() -> None:
 
     logger.info(
         "NanoCrew-Local starting. %d crew(s) loaded. "
-        "Dashboard at http://%s:%d. Polling for Telegram updates...",
+        "Dashboard at http://%s:%d. %sPolling for Telegram updates...",
         len(crew_registry), DASHBOARD_HOST, DASHBOARD_PORT,
+        f"OpenClaw → {OPENCLAW_GATEWAY_URL}. " if ENABLE_OPENCLAW else "",
     )
 
     # drop_pending_updates=True: ignore commands that queued while

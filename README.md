@@ -9,6 +9,7 @@
   <img alt="Ollama" src="https://img.shields.io/badge/LLM-Ollama-orange?logo=data:image/svg+xml;base64," />
   <img alt="Claude" src="https://img.shields.io/badge/LLM-Claude-blueviolet" />
   <img alt="OpenAI" src="https://img.shields.io/badge/LLM-OpenAI--compatible-green" />
+  <img alt="OpenClaw" src="https://img.shields.io/badge/OpenClaw-integrated-red" />
   <img alt="Telegram Bot" src="https://img.shields.io/badge/interface-Telegram-26A5E4?logo=telegram&logoColor=white" />
   <img alt="Hardware" src="https://img.shields.io/badge/target-16GB%20RAM%20·%20no%20GPU-critical" />
 </p>
@@ -120,20 +121,21 @@ Drop a YAML file in `crews/` and your new company is live on the next bot restar
 
 ## Features
 
-| Feature                      | Details                                                                                             |
-| ---------------------------- | --------------------------------------------------------------------------------------------------- |
-| **YAML-Driven Crews**        | Define agent teams as drop-in `.yaml` files in `crews/`. No code changes needed.                    |
-| **Multi-Provider LLM**       | Ollama (local), Claude API, OpenAI-compatible (Groq, Together, vLLM). Per-agent model override.     |
-| **Time-Shared LLM**          | `asyncio.Lock` ensures single-inference execution — safe on 16 GB RAM.                              |
-| **Coding Agent Loop**        | Agents with `can_code: true` write code → execute → read output → self-correct (up to N iterations).|
-| **Hardware Awareness**       | Pre-flight RAM checks warn you before a pipeline exceeds available memory.                          |
-| **Sandboxed Code Execution** | Agents can run whitelisted system commands (opt-in, read-only, audited).                            |
-| **Telegram Interface**       | Full bot with `/scan`, `/crew list`, `/crew info`, `/crew run`, `/status`.                          |
-| **Live Dashboard**           | Local web UI at `http://127.0.0.1:8585` — real-time agent activity, system metrics, AI suggestions. |
-| **Whitelist Auth**           | Only approved Telegram usernames can issue commands. Fail-closed.                                   |
-| **OS Auto-Detection**        | Command whitelists adapt to Linux or Windows automatically.                                         |
-| **Single-File Core**         | All logic in one `core_orchestrator.py`. Clone and run.                                             |
-| **Ultra-Light Deps**         | 5 packages: `python-telegram-bot`, `python-dotenv`, `psutil`, `pyyaml`, `aiohttp`.                  |
+| Feature                      | Details                                                                                              |
+| ---------------------------- | ---------------------------------------------------------------------------------------------------- |
+| **YAML-Driven Crews**        | Define agent teams as drop-in `.yaml` files in `crews/`. No code changes needed.                     |
+| **Multi-Provider LLM**       | Ollama (local), Claude API, OpenAI-compatible (Groq, Together, vLLM). Per-agent model override.      |
+| **Time-Shared LLM**          | `asyncio.Lock` ensures single-inference execution — safe on 16 GB RAM.                               |
+| **Coding Agent Loop**        | Agents with `can_code: true` write code → execute → read output → self-correct (up to N iterations). |
+| **Hardware Awareness**       | Pre-flight RAM checks warn you before a pipeline exceeds available memory.                           |
+| **Sandboxed Code Execution** | Agents can run whitelisted system commands (opt-in, read-only, audited).                             |
+| **OpenClaw Integration**     | Bidirectional bridge: accept tasks from OpenClaw, send results back. REST API + WebSocket.            |
+| **Telegram Interface**       | Full bot with `/scan`, `/crew list`, `/crew info`, `/crew run`, `/status`.                           |
+| **Live Dashboard**           | Local web UI at `http://127.0.0.1:8585` — real-time agent activity, system metrics, AI suggestions.  |
+| **Whitelist Auth**           | Only approved Telegram usernames can issue commands. Fail-closed.                                    |
+| **OS Auto-Detection**        | Command whitelists adapt to Linux or Windows automatically.                                          |
+| **Single-File Core**         | All logic in one `core_orchestrator.py`. Clone and run.                                              |
+| **Ultra-Light Deps**         | 5 packages: `python-telegram-bot`, `python-dotenv`, `psutil`, `pyyaml`, `aiohttp`.                   |
 
 ---
 
@@ -336,7 +338,7 @@ In any crew YAML, set `model:` with a provider prefix:
 ```yaml
 agents:
   - name: "Strategist"
-    model: claude:claude-sonnet-4-20250514   # Uses Claude API
+    model: claude:claude-sonnet-4-20250514 # Uses Claude API
     # model: openai:gpt-4o              # Uses OpenAI-compatible API
     # model: ollama:gemma4:4b            # Explicit Ollama (same as default)
     # model: gemma4:4b                   # No prefix → uses DEFAULT_PROVIDER
@@ -347,12 +349,12 @@ agents:
 ```yaml
 agents:
   - name: "Planner"
-    model: claude:claude-sonnet-4-20250514   # Cloud for complex reasoning
+    model: claude:claude-sonnet-4-20250514 # Cloud for complex reasoning
     role: "Plan the approach"
     system_prompt: "..."
 
   - name: "Executor"
-    model: ollama:gemma4:4b        # Local for fast, simple tasks
+    model: ollama:gemma4:4b # Local for fast, simple tasks
     role: "Execute the plan"
     system_prompt: "..."
 ```
@@ -376,14 +378,14 @@ CODE_AGENT_TIMEOUT=60          # Seconds per execution
 
 Then set `can_code: true` on the relevant agent(s) in your crew YAML:
 
-```yaml
+````yaml
 agents:
   - name: "Coder"
     can_code: true
     role: "Write and execute code"
     system_prompt: "Write code in ```python blocks..."
     temperature: 0.2
-```
+````
 
 ### How It Works
 
@@ -396,16 +398,16 @@ agents:
 
 ### Security Model
 
-| Layer                    | Protection                                                       |
-| ------------------------ | ---------------------------------------------------------------- |
-| **Global kill switch**   | `ENABLE_CODE_AGENT=false` disables all code execution            |
-| **Per-agent flag**       | Only agents with `can_code: true` enter the code loop            |
-| **Temp working dir**     | Code runs in a disposable temp directory                         |
-| **Clean environment**    | No `.env` secrets leaked to subprocesses                         |
-| **Timeout**              | Hard kill after `CODE_AGENT_TIMEOUT` seconds                     |
-| **Output cap**           | Subprocess output truncated at 10 KB                             |
-| **No shell mode**        | Python/Node exec'd directly — no shell metacharacter expansion   |
-| **Iteration cap**        | Loop stops after `CODE_AGENT_MAX_ITERATIONS` (prevents runaway)  |
+| Layer                  | Protection                                                      |
+| ---------------------- | --------------------------------------------------------------- |
+| **Global kill switch** | `ENABLE_CODE_AGENT=false` disables all code execution           |
+| **Per-agent flag**     | Only agents with `can_code: true` enter the code loop           |
+| **Temp working dir**   | Code runs in a disposable temp directory                        |
+| **Clean environment**  | No `.env` secrets leaked to subprocesses                        |
+| **Timeout**            | Hard kill after `CODE_AGENT_TIMEOUT` seconds                    |
+| **Output cap**         | Subprocess output truncated at 10 KB                            |
+| **No shell mode**      | Python/Node exec'd directly — no shell metacharacter expansion  |
+| **Iteration cap**      | Loop stops after `CODE_AGENT_MAX_ITERATIONS` (prevents runaway) |
 
 ### Included Crew: Dev Team
 
@@ -418,6 +420,73 @@ The `dev_team.yaml` crew ships by default with three agents:
 ```
 /crew run dev_team write a Python script that finds duplicate files by hash
 ```
+
+---
+
+## OpenClaw Integration
+
+NanoCrew-Local integrates bidirectionally with [OpenClaw](https://github.com/openclaw/openclaw) (354k+ stars), the personal AI assistant platform.
+
+### What This Enables
+
+| Direction | How It Works |
+| --- | --- |
+| **OpenClaw → NanoCrew** | OpenClaw routes tasks to NanoCrew crew pipelines via Gateway WebSocket. Your OpenClaw assistant can say "run the dev team on this" and trigger a full 3-agent pipeline. |
+| **NanoCrew → OpenClaw** | NanoCrew can push results back into OpenClaw sessions — responses appear in your WhatsApp, Telegram, Slack, Discord, or any other connected channel. |
+| **REST API** | Any tool (OpenClaw or not) can trigger crews via `POST /api/crew/run` — a universal HTTP endpoint. |
+
+### Setup
+
+**1. Enable in NanoCrew-Local:**
+
+```ini
+# In .env
+ENABLE_OPENCLAW=true
+OPENCLAW_GATEWAY_URL=ws://127.0.0.1:18789
+OPENCLAW_API_TOKEN=your-token-here
+OPENCLAW_DEFAULT_CREW=dev_team   # optional — crew for unspecified tasks
+```
+
+**2. Install the NanoCrew skill in OpenClaw:**
+
+Copy the `openclaw-skill/` directory to your OpenClaw workspace:
+
+```bash
+cp -r openclaw-skill ~/.openclaw/workspace/skills/nanocrew
+```
+
+OpenClaw will discover the skill and can use it to run NanoCrew pipelines.
+
+**3. Or use the REST API directly:**
+
+```bash
+# Run a crew pipeline
+curl -X POST http://127.0.0.1:8585/api/crew/run \
+  -H "Content-Type: application/json" \
+  -d '{"crew": "dev_team", "instruction": "Write a rate limiter in Python"}'
+
+# List available crews
+curl http://127.0.0.1:8585/api/crews
+
+# Check system status
+curl http://127.0.0.1:8585/api/status
+```
+
+### How the Gateway Connection Works
+
+```
+┌──────────────────────┐     WebSocket      ┌──────────────────────┐
+│      OpenClaw        │◄──────────────────►│   NanoCrew-Local     │
+│    (Gateway at       │   auto-reconnect   │  (OpenClawConnector) │
+│  ws://127.0.0.1:     │                    │                      │
+│       18789)         │   ──── task ────►  │  → PipelineEngine    │
+│                      │   ◄── result ────  │  → Crew agents       │
+│  WhatsApp/Telegram/  │                    │  → LLM (any provider)│
+│  Slack/Discord/...   │                    │                      │
+└──────────────────────┘                    └──────────────────────┘
+```
+
+The connector auto-reconnects if the Gateway restarts. Tasks from OpenClaw flow through the same crew pipeline as Telegram commands.
 
 ---
 
@@ -453,6 +522,8 @@ nanocrew-local/
 ├── .env.example               # Environment config template
 ├── LICENSE                    # AGPL-3.0
 ├── README.md                  # This file
+├── openclaw-skill/            # OpenClaw skill package (copy to ~/.openclaw/workspace/skills/)
+│   └── SKILL.md               # Skill definition for OpenClaw discovery
 └── crews/
     ├── _template.yaml         # Documented template for new crews
     ├── security_ops.yaml      # Example: security operations crew
