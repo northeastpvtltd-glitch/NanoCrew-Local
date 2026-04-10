@@ -1,7 +1,10 @@
 # ============================================================
-# Security Operations Crew — Default NanoCrew-Local Template
+# Security Operations Crew — Example Company
 # ============================================================
-# A three-agent pipeline for local anomaly and fraud detection.
+# One example of what a NanoCrew company looks like.
+# This one is a security ops team for local device monitoring.
+# See also: startup_team.yaml, customer_support.yaml, content_studio.yaml
+#
 # Agents execute in the order listed: each one receives the
 # previous agent's output as its input.
 # ============================================================

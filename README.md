@@ -1,6 +1,6 @@
 <p align="center">
   <strong>NanoCrew-Local</strong><br>
-  <em>Multi-Agent AI on the Edge — No Cloud, No GPU, No Compromises</em>
+  <em>Build any AI-powered company — runs on the laptop you already own</em>
 </p>
 
 <p align="center">
@@ -15,18 +15,63 @@
 
 ## What Is This?
 
-**NanoCrew-Local** is an open-source Multi-Agent System (MAS) framework purpose-built for **hardware-constrained edge deployments**. It runs entirely on commodity hardware — an Intel Core i5, 16 GB RAM, no dedicated GPU — and delivers autonomous, multi-step AI workflows controlled via Telegram.
+**NanoCrew-Local** lets any user build any type of AI-powered company — a startup, a marketing agency, a law firm, a support center, a security ops team, a content studio — and run it entirely on the hardware they already own.
 
-The default use-case is **continuous local device anomaly and fraud detection**: you send a natural-language instruction to a Telegram bot, and a pipeline of specialized AI agents triages the request, inspects your system with real commands, and reports findings — all without a single byte leaving your machine.
+A **crew** is a YAML file. An **agent** is an employee: a job title, a role, and a system prompt that *is* their brain. Work flows down the org chart — each agent's output becomes the next agent's input. Send a task via Telegram; your company handles it locally. Nothing leaves your machine.
 
-### Why Does This Matter?
+```yaml
+# example: a 3-person content studio
+name: "Content Studio"
+agents:
+  - name: "Brief Writer"    # receives your raw idea
+    role: "Turn a topic into a detailed content brief"
+    system_prompt: "You are a senior content strategist..."
+    temperature: 0.5
+  - name: "Copywriter"      # receives the brief
+    role: "Write a first draft from the brief"
+    system_prompt: "You are a professional copywriter..."
+    temperature: 0.7
+  - name: "Editor"          # receives the draft
+    role: "Polish the copy and prepare it for publishing"
+    system_prompt: "You are a meticulous editor..."
+    temperature: 0.3
+```
 
-Most multi-agent frameworks assume cloud-scale resources. NanoCrew-Local proves that **meaningful agentic AI can run on the hardware already on your desk**. This makes it ideal for:
+This is the entire mental model. The rest is plumbing.
 
-- **Air-gapped security operations** where data cannot leave the premises
-- **IoT edge nodes** with limited compute budgets
-- **Privacy-first personal automation** with zero cloud dependency
-- **Research and education** on multi-agent systems without GPU access
+### Philosophy
+
+Inspired by Karpathy's **nanoGPT** — *"the simplest, fastest repository… plain and readable, very easy to hack to your needs"*:
+
+- **One file** — all logic in `core_orchestrator.py`. No package to install; just clone and run.
+- **YAML = org chart** — no code required to define a new company or add employees
+- **One dial** — more agents = bigger pipeline. Everything else is automatic.
+- **No giant config objects** — no model factories, no if-then-else monsters
+- **Maximally forkable** — clone, remove what you don't need, add what you do
+
+### Any Company. Any Industry.
+
+| Company Type       | Example Pipeline                                              |
+| ------------------ | ------------------------------------------------------------- |
+| Tech Startup       | CEO Adviser → Developer → Product Writer                      |
+| Marketing Agency   | Strategist → Copywriter → Analytics Reporter                  |
+| Customer Support   | Triage Agent → Resolver → Escalation Manager                  |
+| Legal Firm         | Intake → Researcher → Brief Writer                            |
+| Security Ops       | Analyst → Engineer → Reporter *(ships by default)*            |
+| Content Studio     | Brief Writer → Copywriter → Editor                            |
+| Finance Team       | Data Collector → Analyst → CFO Summary                        |
+| HR Department      | Screener → Interview Planner → Offer Writer                   |
+| E-Commerce         | Product Researcher → Listing Writer → SEO Reviewer            |
+| Healthcare Admin   | Intake → Clinical Advisor → Documentation Specialist          |
+
+Drop a YAML file in `crews/` and your new company is live on the next bot restart.
+
+### Why Local?
+
+- **No per-token bills** — Ollama runs the model on your own hardware
+- **Privacy first** — data never leaves your machine
+- **Air-gap friendly** — works without any internet after initial setup
+- **Research and education** — full agentic AI without GPU access
 
 ---
 
@@ -151,29 +196,39 @@ Open Telegram, find your bot, and send `/start`.
 
 ---
 
-## Creating Custom Crews
+## Creating Your Company
 
-1. Copy `crews/_template.yaml` to a new file (e.g., `crews/log_analysis.yaml`).
-2. Define your agents in pipeline order — each one's output feeds the next.
+1. Copy `crews/_template.yaml` to a new file (e.g., `crews/my_company.yaml`).
+2. Define your agents (employees) in pipeline order — each one's output feeds the next.
 3. Restart the bot. It auto-discovers all `*.yaml` files in `crews/`.
 
 ```yaml
-name: "Log Analysis"
-description: "Analyze system logs for errors and anomalies."
+name: "Marketing Agency"
+description: "Plan and write marketing campaigns from a single brief."
 recommended_max_ram_gb: 16
 
 agents:
-  - name: "Log Collector"
-    role: "Gather and filter relevant log entries"
-    can_execute: true # runs commands like journalctl, wevtutil
+  - name: "Strategist"
+    role: "Develop a campaign strategy from the raw brief"
     system_prompt: |
-      You are a log collection specialist...
-    temperature: 0.3
+      You are a senior marketing strategist.
+      Receive a raw campaign brief and produce a structured strategy:
+      target audience, key message, channels, tone of voice.
+    temperature: 0.6
 
-  - name: "Anomaly Detector"
-    role: "Identify patterns and anomalies in logs"
+  - name: "Copywriter"
+    role: "Write campaign copy from the strategy"
     system_prompt: |
-      You receive filtered log data...
+      You receive a marketing strategy.
+      Write compelling ad copy, email subject lines, and social posts.
+      Match the tone and targeting from the strategy exactly.
+    temperature: 0.7
+
+  - name: "Analytics Reporter"
+    role: "Suggest KPIs and success metrics for the campaign"
+    system_prompt: |
+      You receive campaign copy and strategy.
+      Propose specific, measurable KPIs and a reporting cadence.
     temperature: 0.4
 ```
 
@@ -254,7 +309,10 @@ nanocrew-local/
 ├── README.md              # This file
 └── crews/
     ├── _template.yaml     # Documented template for new crews
-    └── security_ops.yaml  # Default: anomaly & fraud detection
+    ├── security_ops.yaml      # Example: security operations crew
+    ├── startup_team.yaml      # Example: tech startup team
+    ├── customer_support.yaml  # Example: customer support pipeline
+    └── content_studio.yaml    # Example: content creation studio
 ```
 
 ---
@@ -283,6 +341,6 @@ To contribute:
 ---
 
 <p align="center">
-  Built for the machines you already own.<br>
-  <strong>NanoCrew-Local</strong> — edge-native multi-agent AI.
+  Any company. Any industry. On the hardware you already own.<br>
+  <strong>NanoCrew-Local</strong> — your AI workforce, running locally.
 </p>

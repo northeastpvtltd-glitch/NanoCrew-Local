@@ -1,17 +1,28 @@
 # ============================================================
-# NanoCrew-Local — Crew Template
+# NanoCrew-Local — Crew (Company) Template
 # ============================================================
-# Copy this file, rename it (e.g., my_crew.yaml), and place it
-# in the crews/ directory.  The bot auto-discovers all *.yaml
-# files in this folder on startup.
+# A "crew" is your company.  An "agent" is an employee.
+# Copy this file, rename it (e.g., my_company.yaml), and place
+# it in the crews/ directory.  The bot auto-discovers all
+# *.yaml files in this folder on startup.
 #
 # Files starting with _ (like this one) are ignored by the
 # loader, so this template is never treated as a live crew.
 #
-# PIPELINE ORDER:
-#   Agents execute top-to-bottom.  The first agent receives the
-#   user's raw instruction.  Every subsequent agent receives the
+# PIPELINE ORDER (the org chart):
+#   Agents execute top-to-bottom.  The first agent receives
+#   the user's raw task.  Every subsequent agent receives the
 #   previous agent's full output as its input.
+#   Think of it as passing work down the chain of command.
+#
+# EXAMPLE COMPANY TYPES:
+#   Marketing Agency:  Strategist -> Copywriter -> Analytics
+#   Tech Startup:      CEO Adviser -> Developer -> Writer
+#   Law Firm:          Intake -> Researcher -> Brief Writer
+#   Support Center:    Triage -> Resolver -> Escalation Mgr
+#   Security Ops:      Analyst -> Engineer -> Reporter
+#   Content Studio:    Brief Writer -> Copywriter -> Editor
+#   Finance Team:      Collector -> Analyst -> CFO Summary
 #
 # HARDWARE GUIDELINE:
 #   On 16 GB RAM with a 4B model, 3 agents is the comfortable
@@ -19,18 +30,22 @@
 #   Scale up hardware before scaling up agent count.
 # ============================================================
 
-name: "My Custom Crew"
-description: "Describe what this crew does in one sentence."
+name: "My Company"
+description: "What does this company do? One sentence."
 
 # Optional: the engine warns users when available RAM is below this.
 recommended_max_ram_gb: 16
 
 agents:
-  - name: "First Agent"
-    role: "What this agent does in one line"
+  # ----------------------------------------------------------
+  # Employee 1 — first in the chain
+  # Receives the user's raw task directly.
+  # ----------------------------------------------------------
+  - name: "First Employee"
+    role: "What this person does in one line"
     system_prompt: |
-      You are [role description].
-      Your task is to [specific instructions].
+      You are [job title].
+      Your job is to [specific instructions for this role].
 
       RULES:
       - [Rule 1]
@@ -39,23 +54,26 @@ agents:
       OUTPUT FORMAT:
       [Describe the structure your output should follow]
     temperature: 0.5
-    # can_execute: false         # Set to true to allow this agent to run
-    #                            # system commands from fenced code blocks.
-    #                            # Requires ENABLE_CODE_EXECUTION=true in .env.
-    #                            # Only whitelisted read-only commands are
-    #                            # permitted — see core_orchestrator.py.
-    # model: "gemma4:12b"       # Optional: override the global model
-    # options:                   # Optional: raw Ollama generation options
+    # can_execute: false       # Set true to run whitelisted system commands.
+    #                          # Requires ENABLE_CODE_EXECUTION=true in .env.
+    #                          # See core_orchestrator.py for the whitelist.
+    # model: "gemma4:12b"     # Optional: per-agent model override
+    # options:                 # Optional: raw Ollama generation options
     #   top_p: 0.9
     #   num_predict: 2048
 
-  - name: "Second Agent"
-    role: "What this agent does in one line"
+  # ----------------------------------------------------------
+  # Employee 2 — receives Employee 1's output as input
+  # ----------------------------------------------------------
+  - name: "Second Employee"
+    role: "What this person does in one line"
     system_prompt: |
-      You are [role description].
-      You receive input from the previous agent.
-      Your task is to [specific instructions].
+      You are [job title].
+      You receive work from [First Employee's title].
+      Your job is to [specific instructions for this role].
     temperature: 0.5
 
-  # Add more agents below.  Each one chains from the previous.
-  # Remember: more agents = longer pipeline time on constrained hardware.
+  # ----------------------------------------------------------
+  # Add more employees below.  Each one receives the previous
+  # employee's full output.  On 16 GB RAM, keep to 3 agents.
+  # ----------------------------------------------------------
