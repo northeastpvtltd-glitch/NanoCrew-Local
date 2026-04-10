@@ -5,7 +5,7 @@
 
 <p align="center">
   <img alt="Python 3.11+" src="https://img.shields.io/badge/python-3.11+-blue?logo=python&logoColor=white" />
-  <img alt="License: MIT" src="https://img.shields.io/badge/license-MIT-green" />
+  <img alt="License: AGPL-3.0" src="https://img.shields.io/badge/license-AGPL--3.0-blue" />
   <img alt="Ollama" src="https://img.shields.io/badge/LLM-Ollama-orange?logo=data:image/svg+xml;base64," />
   <img alt="Telegram Bot" src="https://img.shields.io/badge/interface-Telegram-26A5E4?logo=telegram&logoColor=white" />
   <img alt="Hardware" src="https://img.shields.io/badge/target-16GB%20RAM%20·%20no%20GPU-critical" />
@@ -122,10 +122,11 @@ Drop a YAML file in `crews/` and your new company is live on the next bot restar
 | **Hardware Awareness**       | Pre-flight RAM checks warn you before a pipeline exceeds available memory.       |
 | **Sandboxed Code Execution** | Agents can run whitelisted system commands (opt-in, read-only, audited).         |
 | **Telegram Interface**       | Full bot with `/scan`, `/crew list`, `/crew info`, `/crew run`, `/status`.       |
+| **Live Dashboard**           | Local web UI at `http://127.0.0.1:8585` — real-time agent activity, system metrics, AI suggestions. |
 | **Whitelist Auth**           | Only approved Telegram usernames can issue commands. Fail-closed.                |
 | **OS Auto-Detection**        | Command whitelists adapt to Linux or Windows automatically.                      |
-| **Single-File Core**         | All logic in one `core_orchestrator.py` (~900 lines). Clone and run.             |
-| **Ultra-Light Deps**         | 4 packages: `python-telegram-bot`, `python-dotenv`, `psutil`, `pyyaml`.          |
+| **Single-File Core**         | All logic in one `core_orchestrator.py`. Clone and run.                          |
+| **Ultra-Light Deps**         | 5 packages: `python-telegram-bot`, `python-dotenv`, `psutil`, `pyyaml`, `aiohttp`. |
 
 ---
 
@@ -193,6 +194,34 @@ Open Telegram, find your bot, and send `/start`.
 ```
 /scan check for unusual network connections on high ports
 ```
+
+---
+
+## Live Dashboard
+
+NanoCrew-Local ships with a **local web dashboard** that launches automatically alongside the bot.
+
+**Default URL:** `http://127.0.0.1:8585`
+
+### What You See
+
+| Panel              | Description                                                                    |
+| ------------------ | ------------------------------------------------------------------------------ |
+| **System Resources** | Real-time CPU, RAM, and disk usage with color-coded progress bars             |
+| **Ollama Status**  | Model name, online/offline status, LLM lock state, code execution toggle       |
+| **Companies**      | All loaded crews with their agents — active agents glow green during pipelines |
+| **Live Activity**  | Timestamped feed of agent starts and completions, streamed via WebSocket        |
+| **AI Suggestions** | One-click button asks your LLM to analyze your setup and suggest improvements  |
+
+### Configuration
+
+```ini
+# In .env
+DASHBOARD_HOST=127.0.0.1   # Bind address (default: localhost only)
+DASHBOARD_PORT=8585         # Port (default: 8585)
+```
+
+The dashboard requires **no authentication** — it binds to `127.0.0.1` by default (localhost only, not reachable from the network). If you change `DASHBOARD_HOST` to `0.0.0.0`, the dashboard becomes network-accessible — only do this on trusted networks.
 
 ---
 
@@ -302,17 +331,21 @@ Code execution is **opt-in** and **defense-in-depth**:
 
 ```
 nanocrew-local/
-├── core_orchestrator.py   # All framework logic (~900 lines)
-├── requirements.txt       # 4 dependencies
-├── .env.example           # Environment config template
-├── LICENSE                # MIT
-├── README.md              # This file
+├── core_orchestrator.py       # All framework logic
+├── dashboard.html             # Single-page local dashboard UI
+├── requirements.txt           # 5 dependencies
+├── .env.example               # Environment config template
+├── LICENSE                    # AGPL-3.0
+├── README.md                  # This file
 └── crews/
-    ├── _template.yaml     # Documented template for new crews
+    ├── _template.yaml         # Documented template for new crews
     ├── security_ops.yaml      # Example: security operations crew
     ├── startup_team.yaml      # Example: tech startup team
     ├── customer_support.yaml  # Example: customer support pipeline
-    └── content_studio.yaml    # Example: content creation studio
+    ├── content_studio.yaml    # Example: content creation studio
+    ├── finance_team.yaml      # Example: finance team
+    ├── legal_review.yaml      # Example: legal review crew
+    └── health_wellness.yaml   # Example: health & wellness crew
 ```
 
 ---
@@ -336,7 +369,7 @@ To contribute:
 
 ## License
 
-[MIT](LICENSE) — free for personal, commercial, and research use.
+[AGPL-3.0](LICENSE) — free to use, modify, and distribute. Network use requires source disclosure. See [LICENSE](LICENSE) for details.
 
 ---
 

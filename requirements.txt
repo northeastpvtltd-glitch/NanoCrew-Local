@@ -15,3 +15,6 @@ psutil>=5.9.0
 
 # YAML parsing for crew definition files in crews/*.yaml.
 pyyaml>=6.0
+
+# Async HTTP server + WebSocket for the local dashboard UI.
+aiohttp>=3.9.0

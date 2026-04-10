@@ -30,19 +30,22 @@ Usage:
 from __future__ import annotations
 
 import asyncio
+import json
 import logging
 import os
 import platform
 import re
 import sys
 import tempfile
-from dataclasses import dataclass, field
+import time
+from dataclasses import dataclass, field, asdict
 from pathlib import Path
 from typing import Callable, Optional
 
 import httpx
 import psutil
 import yaml
+from aiohttp import web
 from dotenv import load_dotenv
 from telegram import Update
 from telegram.ext import (
@@ -69,6 +72,8 @@ CREWS_DIR: str = os.getenv("CREWS_DIR", "crews")
 ENABLE_CODE_EXECUTION: bool = os.getenv("ENABLE_CODE_EXECUTION", "false").lower() in ("true", "1", "yes")
 COMMAND_TIMEOUT: int = int(os.getenv("COMMAND_TIMEOUT", "30"))
 LOG_LEVEL: str = os.getenv("LOG_LEVEL", "INFO")
+DASHBOARD_HOST: str = os.getenv("DASHBOARD_HOST", "127.0.0.1")
+DASHBOARD_PORT: int = int(os.getenv("DASHBOARD_PORT", "8585"))
 
 # ============================================================
 # Poor Man's Configurator — inspired by nanoGPT/configurator.py
@@ -634,6 +639,14 @@ class PipelineEngine:
             if on_agent_start:
                 await on_agent_start(agent.name, step, total)
 
+            await event_bus.publish({
+                "type": "agent_start",
+                "crew": crew.name,
+                "agent": agent.name,
+                "step": step,
+                "total": total,
+            })
+
             # Build the prompt.  The first agent sees the raw instruction;
             # subsequent agents see the previous agent's output with framing.
             if i == 0:
@@ -674,6 +687,15 @@ class PipelineEngine:
             # --- Notify: agent done ---
             if on_agent_done:
                 await on_agent_done(agent.name, output, step, total)
+
+            await event_bus.publish({
+                "type": "agent_done",
+                "crew": crew.name,
+                "agent": agent.name,
+                "step": step,
+                "total": total,
+                "output_length": len(output),
+            })
 
         return steps
 
@@ -781,6 +803,215 @@ def log_hardware_report(crew_registry: dict[str, Crew]) -> None:
             "Less than 8 GB total RAM detected. Performance may be poor. "
             "Consider using a smaller model or fewer agents."
         )
+
+
+# ============================================================
+# Event Bus — broadcasts pipeline + system events to WebSocket clients
+# ============================================================
+
+class EventBus:
+    """Simple async pub/sub for dashboard WebSocket clients."""
+
+    def __init__(self) -> None:
+        self._subscribers: set[web.WebSocketResponse] = set()
+        self._event_log: list[dict] = []  # Last N events for new clients
+        self._max_log = 200
+
+    async def subscribe(self, ws: web.WebSocketResponse) -> None:
+        self._subscribers.add(ws)
+        # Send recent history to new client
+        for event in self._event_log:
+            try:
+                await ws.send_json(event)
+            except (ConnectionError, RuntimeError):
+                break
+
+    def unsubscribe(self, ws: web.WebSocketResponse) -> None:
+        self._subscribers.discard(ws)
+
+    async def publish(self, event: dict) -> None:
+        event.setdefault("ts", time.time())
+        self._event_log.append(event)
+        if len(self._event_log) > self._max_log:
+            self._event_log = self._event_log[-self._max_log:]
+        dead: list[web.WebSocketResponse] = []
+        for ws in self._subscribers:
+            try:
+                await ws.send_json(event)
+            except (ConnectionError, RuntimeError):
+                dead.append(ws)
+        for ws in dead:
+            self._subscribers.discard(ws)
+
+    def clear_log(self) -> None:
+        self._event_log.clear()
+
+
+event_bus = EventBus()
+
+
+# ============================================================
+# Dashboard Web Server — aiohttp + WebSocket
+# ============================================================
+
+class DashboardServer:
+    """Serves the local dashboard UI and WebSocket events."""
+
+    def __init__(self, host: str, port: int) -> None:
+        self._host = host
+        self._port = port
+        self._app = web.Application()
+        self._app.router.add_get("/", self._handle_index)
+        self._app.router.add_get("/ws", self._handle_ws)
+        self._app.router.add_get("/api/status", self._handle_status)
+        self._app.router.add_get("/api/crews", self._handle_crews)
+        self._app.router.add_post("/api/suggest", self._handle_suggest)
+        self._runner: web.AppRunner | None = None
+        self._metrics_task: asyncio.Task | None = None
+
+    async def start(self) -> None:
+        self._runner = web.AppRunner(self._app)
+        await self._runner.setup()
+        site = web.TCPSite(self._runner, self._host, self._port)
+        await site.start()
+        self._metrics_task = asyncio.create_task(self._metrics_loop())
+        logger.info("Dashboard running at http://%s:%d", self._host, self._port)
+
+    async def stop(self) -> None:
+        if self._metrics_task:
+            self._metrics_task.cancel()
+        if self._runner:
+            await self._runner.cleanup()
+
+    async def _metrics_loop(self) -> None:
+        """Publish system metrics every 3 seconds."""
+        while True:
+            try:
+                mem = psutil.virtual_memory()
+                cpu = psutil.cpu_percent(interval=0)
+                disk = psutil.disk_usage("/") if platform.system() != "Windows" else psutil.disk_usage("C:\\")
+                await event_bus.publish({
+                    "type": "metrics",
+                    "cpu_percent": cpu,
+                    "ram_total_gb": round(mem.total / (1024**3), 1),
+                    "ram_used_gb": round(mem.used / (1024**3), 1),
+                    "ram_percent": mem.percent,
+                    "disk_total_gb": round(disk.total / (1024**3), 1),
+                    "disk_used_gb": round(disk.used / (1024**3), 1),
+                    "disk_percent": disk.percent,
+                })
+                await asyncio.sleep(3)
+            except asyncio.CancelledError:
+                break
+            except Exception:
+                await asyncio.sleep(3)
+
+    async def _handle_index(self, request: web.Request) -> web.Response:
+        """Serve the single-page dashboard."""
+        dashboard_path = Path(__file__).parent / "dashboard.html"
+        if not dashboard_path.exists():
+            return web.Response(text="dashboard.html not found", status=404)
+        return web.FileResponse(dashboard_path)
+
+    async def _handle_ws(self, request: web.Request) -> web.WebSocketResponse:
+        """WebSocket endpoint for live event streaming."""
+        ws = web.WebSocketResponse()
+        await ws.prepare(request)
+        await event_bus.subscribe(ws)
+        try:
+            async for msg in ws:
+                pass  # Client doesn't send; just keep alive
+        finally:
+            event_bus.unsubscribe(ws)
+        return ws
+
+    async def _handle_status(self, request: web.Request) -> web.Response:
+        """REST endpoint: system + Ollama status."""
+        mem = psutil.virtual_memory()
+        ollama_ok = await llm.health_check()
+        data = {
+            "ollama_online": ollama_ok,
+            "model": OLLAMA_MODEL,
+            "llm_busy": llm._lock.locked(),
+            "code_execution": ENABLE_CODE_EXECUTION,
+            "cpu_percent": psutil.cpu_percent(interval=0),
+            "ram_total_gb": round(mem.total / (1024**3), 1),
+            "ram_used_gb": round(mem.used / (1024**3), 1),
+            "ram_percent": mem.percent,
+            "crews_loaded": len(crew_registry),
+            "total_agents": sum(len(c.agents) for c in crew_registry.values()),
+        }
+        return web.json_response(data)
+
+    async def _handle_crews(self, request: web.Request) -> web.Response:
+        """REST endpoint: list all loaded crews and their agents."""
+        crews = []
+        for key, crew in crew_registry.items():
+            crews.append({
+                "key": key,
+                "name": crew.name,
+                "description": crew.description,
+                "source_file": Path(crew.source_file).name,
+                "recommended_max_ram_gb": crew.recommended_max_ram_gb,
+                "agents": [
+                    {
+                        "name": a.name,
+                        "role": a.role,
+                        "temperature": a.temperature,
+                        "can_execute": a.can_execute,
+                        "model": a.model or OLLAMA_MODEL,
+                    }
+                    for a in crew.agents
+                ],
+            })
+        return web.json_response(crews)
+
+    async def _handle_suggest(self, request: web.Request) -> web.Response:
+        """AI suggestions endpoint — asks the LLM to analyze current setup."""
+        mem = psutil.virtual_memory()
+        cpu = psutil.cpu_percent(interval=0.5)
+        disk = psutil.disk_usage("C:\\" if platform.system() == "Windows" else "/")
+
+        crew_summary = []
+        for key, c in crew_registry.items():
+            agents = ", ".join(f"{a.name} (temp={a.temperature}, exec={a.can_execute})" for a in c.agents)
+            crew_summary.append(f"  {c.name}: {agents}")
+
+        system_context = (
+            f"System: {platform.system()} {platform.release()}, "
+            f"CPU cores: {psutil.cpu_count()}, CPU usage: {cpu}%\n"
+            f"RAM: {mem.used / (1024**3):.1f}/{mem.total / (1024**3):.1f} GB ({mem.percent}% used)\n"
+            f"Disk: {disk.used / (1024**3):.1f}/{disk.total / (1024**3):.1f} GB ({disk.percent}% used)\n"
+            f"Ollama model: {OLLAMA_MODEL}\n"
+            f"Code execution: {'enabled' if ENABLE_CODE_EXECUTION else 'disabled'}\n"
+            f"Loaded crews ({len(crew_registry)}):\n" + "\n".join(crew_summary)
+        )
+
+        prompt = (
+            "You are an AI systems advisor for NanoCrew-Local. "
+            "Analyze this system configuration and provide 3-5 specific, actionable suggestions "
+            "to improve performance, reliability, or agent quality. "
+            "Be concise (1-2 sentences per suggestion). "
+            "Consider: RAM budget, model choice, agent count, temperature tuning, "
+            "missing crew types the user might benefit from.\n\n"
+            f"SYSTEM INFO:\n{system_context}"
+        )
+
+        try:
+            response = await llm.generate(
+                prompt=prompt,
+                system_prompt="You are a helpful systems advisor. Be specific and actionable.",
+                temperature=0.4,
+            )
+            return web.json_response({"suggestions": response})
+        except Exception as exc:
+            return web.json_response(
+                {"error": f"Failed to generate suggestions: {exc}"},
+                status=500,
+            )
+
+
+dashboard_server: DashboardServer | None = None
 
 
 # ============================================================
@@ -1083,7 +1314,7 @@ def main() -> None:
         4. Log a hardware report.
         5. Build the Telegram Application and start polling.
     """
-    global llm, engine, executor, crew_registry
+    global llm, engine, executor, crew_registry, dashboard_server
 
     _print_banner()
 
@@ -1140,9 +1371,22 @@ def main() -> None:
     app.add_handler(CommandHandler("scan", cmd_scan))
     app.add_handler(CommandHandler("crew", cmd_crew))
 
+    # --- Start the dashboard web server ---
+    dashboard_server = DashboardServer(DASHBOARD_HOST, DASHBOARD_PORT)
+
+    async def post_init(application) -> None:
+        await dashboard_server.start()
+
+    async def post_shutdown(application) -> None:
+        await dashboard_server.stop()
+
+    app.post_init = post_init
+    app.post_shutdown = post_shutdown
+
     logger.info(
-        "NanoCrew-Local starting. %d crew(s) loaded. Polling for Telegram updates...",
-        len(crew_registry),
+        "NanoCrew-Local starting. %d crew(s) loaded. "
+        "Dashboard at http://%s:%d. Polling for Telegram updates...",
+        len(crew_registry), DASHBOARD_HOST, DASHBOARD_PORT,
     )
 
     # drop_pending_updates=True: ignore commands that queued while
