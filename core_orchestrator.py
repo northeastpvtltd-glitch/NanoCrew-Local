@@ -9,17 +9,20 @@ pipeline sequentially, using a time-shared local LLM (Ollama) to
 keep memory usage within safe bounds.
 
 Architecture:
-    Telegram Bot  ──>  PipelineEngine  ──>  LLMClient  ──>  Ollama
-         │                   │
-         │            Crew (YAML-defined)
+    Telegram Bot  ──>  PipelineEngine  ──>  LLMClient  ──>  Ollama (local)
+         │                   │                   ├──>  Claude API
+         │            Crew (YAML-defined)        └──>  OpenAI-compatible
          │            ├─ Agent 1  (gets raw instruction)
          │            ├─ Agent 2  (gets Agent 1 output)
          │            └─ Agent N  (gets Agent N-1 output)
+         │                   │
+         │            CodeExecutor (can_code agents)
+         │            └─ write code → execute → read output → fix → repeat
          │
          └── sends final report back to user
 
 Key constraint: asyncio.Lock inside LLMClient guarantees that only
-ONE Ollama inference runs at a time — preventing OOM on 16 GB systems.
+ONE inference runs at a time — preventing OOM on 16 GB systems.
 
 Usage:
     1. Copy .env.example to .env and fill in your values.
@@ -74,6 +77,17 @@ COMMAND_TIMEOUT: int = int(os.getenv("COMMAND_TIMEOUT", "30"))
 LOG_LEVEL: str = os.getenv("LOG_LEVEL", "INFO")
 DASHBOARD_HOST: str = os.getenv("DASHBOARD_HOST", "127.0.0.1")
 DASHBOARD_PORT: int = int(os.getenv("DASHBOARD_PORT", "8585"))
+
+# ---- Multi-Provider LLM Config ----
+ANTHROPIC_API_KEY: str = os.getenv("ANTHROPIC_API_KEY", "")
+OPENAI_API_KEY: str = os.getenv("OPENAI_API_KEY", "")
+OPENAI_BASE_URL: str = os.getenv("OPENAI_BASE_URL", "https://api.openai.com/v1")
+DEFAULT_PROVIDER: str = os.getenv("DEFAULT_PROVIDER", "ollama")  # ollama | claude | openai
+
+# ---- Coding Agent Config ----
+ENABLE_CODE_AGENT: bool = os.getenv("ENABLE_CODE_AGENT", "false").lower() in ("true", "1", "yes")
+CODE_AGENT_MAX_ITERATIONS: int = int(os.getenv("CODE_AGENT_MAX_ITERATIONS", "5"))
+CODE_AGENT_TIMEOUT: int = int(os.getenv("CODE_AGENT_TIMEOUT", "60"))
 
 # ============================================================
 # Poor Man's Configurator — inspired by nanoGPT/configurator.py
@@ -244,6 +258,7 @@ class AgentProfile:
     model: str | None = None       # None → use global OLLAMA_MODEL
     options: dict | None = None    # Raw Ollama generation options passthrough
     can_execute: bool = False      # Whether this agent may run system commands
+    can_code: bool = False         # Whether this agent uses the coding loop
 
 
 @dataclass
@@ -295,6 +310,7 @@ class Crew:
                     model=entry.get("model"),
                     options=entry.get("options"),
                     can_execute=bool(entry.get("can_execute", False)),
+                    can_code=bool(entry.get("can_code", False)),
                 )
             )
 
@@ -308,29 +324,89 @@ class Crew:
 
 
 # ============================================================
-# LLM Client — time-shared Ollama access
+# LLM Client — multi-provider (Ollama / Claude / OpenAI-compat)
 # ============================================================
+
+def _parse_model_spec(model_str: str | None) -> tuple[str, str]:
+    """
+    Parse a model specifier like 'claude:claude-sonnet-4-20250514' or 'openai:gpt-4o'
+    into (provider, model_name).  Plain names default to the global
+    DEFAULT_PROVIDER.
+    """
+    if not model_str:
+        return DEFAULT_PROVIDER, ""
+    if ":" in model_str:
+        parts = model_str.split(":", 1)
+        provider = parts[0].lower()
+        if provider in ("claude", "anthropic"):
+            return "claude", parts[1]
+        if provider in ("openai", "groq", "together", "vllm"):
+            return "openai", parts[1]
+        if provider == "ollama":
+            return "ollama", parts[1]
+        # Unknown prefix — treat the whole string as an Ollama model name
+        # (Ollama models can contain colons, e.g., gemma4:4b).
+        return DEFAULT_PROVIDER, model_str
+    return DEFAULT_PROVIDER, model_str
+
 
 class LLMClient:
     """
-    Async HTTP client for the Ollama REST API.
+    Async multi-provider LLM client.
 
-    The critical feature is the asyncio.Lock inside generate():
-    it guarantees that only ONE inference request is in flight at
-    any time, across all crews and all concurrent Telegram users.
-    This prevents Ollama from being double-loaded on RAM-constrained
-    systems.
+    Supported backends:
+      - **ollama** — Local Ollama REST API (default, free, private).
+      - **claude** — Anthropic Messages API (requires ANTHROPIC_API_KEY).
+      - **openai** — Any OpenAI-compatible endpoint: OpenAI, Groq,
+        Together, local vLLM, etc. (requires OPENAI_API_KEY).
+
+    Model selection per agent:
+      - YAML ``model: claude:claude-sonnet-4-20250514`` → Anthropic
+      - YAML ``model: openai:gpt-4o`` → OpenAI-compatible
+      - YAML ``model: ollama:gemma4:4b`` or just ``gemma4:4b`` → Ollama
+
+    The asyncio.Lock guarantees that only ONE inference request is
+    in flight at any time (across all providers), preventing OOM
+    on RAM-constrained systems when using local models.
     """
 
     def __init__(self, base_url: str, default_model: str) -> None:
         self._base_url = base_url.rstrip("/")
         self._default_model = default_model
         self._lock = asyncio.Lock()
-        # Timeouts: 10 s connect, 5 min read (small models on CPU can be slow).
-        self._client = httpx.AsyncClient(
+
+        # Ollama client (always available).
+        self._ollama = httpx.AsyncClient(
             base_url=self._base_url,
             timeout=httpx.Timeout(connect=10.0, read=300.0, write=10.0, pool=10.0),
         )
+
+        # Claude (Anthropic) client — lazy, only if key is set.
+        self._claude: httpx.AsyncClient | None = None
+        if ANTHROPIC_API_KEY:
+            self._claude = httpx.AsyncClient(
+                base_url="https://api.anthropic.com",
+                timeout=httpx.Timeout(connect=10.0, read=300.0, write=10.0, pool=10.0),
+                headers={
+                    "x-api-key": ANTHROPIC_API_KEY,
+                    "anthropic-version": "2023-06-01",
+                    "content-type": "application/json",
+                },
+            )
+            logger.info("Claude API enabled (key set)")
+
+        # OpenAI-compatible client — lazy, only if key is set.
+        self._openai: httpx.AsyncClient | None = None
+        if OPENAI_API_KEY:
+            self._openai = httpx.AsyncClient(
+                base_url=OPENAI_BASE_URL.rstrip("/"),
+                timeout=httpx.Timeout(connect=10.0, read=300.0, write=10.0, pool=10.0),
+                headers={
+                    "Authorization": f"Bearer {OPENAI_API_KEY}",
+                    "Content-Type": "application/json",
+                },
+            )
+            logger.info("OpenAI-compatible API enabled (key set, base=%s)", OPENAI_BASE_URL)
 
     async def generate(
         self,
@@ -341,47 +417,142 @@ class LLMClient:
         options: dict | None = None,
     ) -> str:
         """
-        Send a prompt to Ollama and return the complete response text.
+        Send a prompt to the appropriate LLM backend and return the
+        complete response text.
 
-        Acquires the global lock before making the request — any other
-        caller that reaches this method concurrently will await until
-        the current inference finishes.
+        Provider is determined by the model specifier:
+            ``claude:claude-sonnet-4-20250514`` → Anthropic
+            ``openai:gpt-4o``     → OpenAI-compatible
+            ``gemma4:4b``         → Ollama (default)
+
+        Acquires the global lock before making the request.
         """
+        provider, model_name = _parse_model_spec(model)
+
+        # Resolve fallback model name.
+        if not model_name:
+            if provider == "claude":
+                model_name = "claude-sonnet-4-20250514"
+            elif provider == "openai":
+                model_name = "gpt-4o-mini"
+            else:
+                model_name = self._default_model
+
         async with self._lock:
-            payload: dict = {
-                "model": model or self._default_model,
-                "prompt": prompt,
-                "stream": False,
-                "options": {
-                    "temperature": temperature,
-                    **(options or {}),
-                },
-            }
-            if system_prompt:
-                payload["system"] = system_prompt
+            if provider == "claude":
+                return await self._generate_claude(prompt, system_prompt, temperature, model_name)
+            elif provider == "openai":
+                return await self._generate_openai(prompt, system_prompt, temperature, model_name)
+            else:
+                return await self._generate_ollama(prompt, system_prompt, temperature, model_name, options)
 
-            logger.debug("Ollama request: model=%s, prompt length=%d", payload["model"], len(prompt))
+    async def _generate_ollama(
+        self, prompt: str, system_prompt: str, temperature: float,
+        model: str, options: dict | None,
+    ) -> str:
+        """Ollama REST API backend."""
+        payload: dict = {
+            "model": model,
+            "prompt": prompt,
+            "stream": False,
+            "options": {"temperature": temperature, **(options or {})},
+        }
+        if system_prompt:
+            payload["system"] = system_prompt
 
-            response = await self._client.post("/api/generate", json=payload)
-            response.raise_for_status()
+        logger.debug("Ollama request: model=%s, prompt length=%d", model, len(prompt))
+        response = await self._ollama.post("/api/generate", json=payload)
+        response.raise_for_status()
+        text = response.json().get("response", "").strip()
+        logger.debug("Ollama response: %d chars", len(text))
+        return text
 
-            data = response.json()
-            text = data.get("response", "").strip()
+    async def _generate_claude(
+        self, prompt: str, system_prompt: str, temperature: float, model: str,
+    ) -> str:
+        """Anthropic Messages API backend."""
+        if not self._claude:
+            raise RuntimeError(
+                "Claude API requested but ANTHROPIC_API_KEY is not set. "
+                "Add it to your .env file."
+            )
 
-            logger.debug("Ollama response: %d chars", len(text))
-            return text
+        messages = [{"role": "user", "content": prompt}]
+        payload: dict = {
+            "model": model,
+            "max_tokens": 4096,
+            "temperature": temperature,
+            "messages": messages,
+        }
+        if system_prompt:
+            payload["system"] = system_prompt
+
+        logger.debug("Claude request: model=%s, prompt length=%d", model, len(prompt))
+        response = await self._claude.post("/v1/messages", json=payload)
+        response.raise_for_status()
+        data = response.json()
+        # Anthropic returns content as a list of blocks.
+        text = ""
+        for block in data.get("content", []):
+            if block.get("type") == "text":
+                text += block.get("text", "")
+        text = text.strip()
+        logger.debug("Claude response: %d chars", len(text))
+        return text
+
+    async def _generate_openai(
+        self, prompt: str, system_prompt: str, temperature: float, model: str,
+    ) -> str:
+        """OpenAI-compatible Chat Completions backend."""
+        if not self._openai:
+            raise RuntimeError(
+                "OpenAI API requested but OPENAI_API_KEY is not set. "
+                "Add it to your .env file."
+            )
+
+        messages = []
+        if system_prompt:
+            messages.append({"role": "system", "content": system_prompt})
+        messages.append({"role": "user", "content": prompt})
+
+        payload: dict = {
+            "model": model,
+            "temperature": temperature,
+            "messages": messages,
+        }
+
+        logger.debug("OpenAI request: model=%s, prompt length=%d", model, len(prompt))
+        response = await self._openai.post("/chat/completions", json=payload)
+        response.raise_for_status()
+        data = response.json()
+        text = data["choices"][0]["message"]["content"].strip()
+        logger.debug("OpenAI response: %d chars", len(text))
+        return text
 
     async def health_check(self) -> bool:
         """Return True if Ollama is reachable and responding."""
         try:
-            resp = await self._client.get("/api/tags")
+            resp = await self._ollama.get("/api/tags")
             return resp.status_code == 200
         except httpx.RequestError:
             return False
 
+    def available_providers(self) -> list[str]:
+        """Return list of configured provider names."""
+        providers = ["ollama"]
+        if self._claude:
+            providers.append("claude")
+        if self._openai:
+            providers.append("openai")
+        return providers
+
     async def close(self) -> None:
-        """Shut down the underlying HTTP connection pool."""
-        await self._client.aclose()
+        """Shut down all underlying HTTP connection pools."""
+        await self._ollama.aclose()
+        if self._claude:
+            await self._claude.aclose()
+        if self._openai:
+            await self._openai.aclose()
 
 
 # ============================================================
@@ -587,6 +758,246 @@ class CommandExecutor:
 
 
 # ============================================================
+# Code Executor — sandboxed code writing + execution loop
+# ============================================================
+
+class CodeExecutor:
+    """
+    Sandboxed code execution engine for coding agents.
+
+    Unlike CommandExecutor (which runs whitelisted system commands),
+    CodeExecutor lets agents write arbitrary Python or JavaScript code,
+    execute it in a sandbox, read the output, and iterate — like
+    Claude Code or Open Interpreter.
+
+    Security model:
+    - Code runs in a disposable temp directory.
+    - No shell=True — exec'd directly via python/node.
+    - Clean environment — no .env secrets leaked.
+    - Hard timeout prevents infinite loops.
+    - Output capped to prevent OOM.
+    - Network access is NOT blocked (user must enable at their own risk).
+    - Opt-in via ENABLE_CODE_AGENT=true.
+    """
+
+    # Extract fenced code blocks with language hints.
+    _CODE_BLOCK_RE = re.compile(
+        r'```(python|javascript|js|node|shell|bash|sh)?\s*\n(.*?)```',
+        re.DOTALL,
+    )
+
+    # Map language hints to interpreter commands.
+    _INTERPRETERS: dict[str, list[str]] = {
+        "python": [sys.executable, "-u"],
+        "javascript": ["node", "-e"],
+        "js": ["node", "-e"],
+        "node": ["node", "-e"],
+    }
+
+    def __init__(
+        self,
+        timeout: int = CODE_AGENT_TIMEOUT,
+        max_iterations: int = CODE_AGENT_MAX_ITERATIONS,
+        output_limit: int = COMMAND_OUTPUT_LIMIT,
+    ) -> None:
+        self._timeout = timeout
+        self._max_iterations = max_iterations
+        self._output_limit = output_limit
+        self._clean_env = self._build_clean_env()
+        logger.info(
+            "CodeExecutor initialized: timeout=%ds, max_iterations=%d",
+            self._timeout, self._max_iterations,
+        )
+
+    @staticmethod
+    def _build_clean_env() -> dict[str, str]:
+        safe_keys = {"PATH", "SYSTEMROOT", "COMSPEC", "TEMP", "TMP", "HOME", "USER", "LANG"}
+        return {k: v for k, v in os.environ.items() if k in safe_keys}
+
+    def extract_code_blocks(self, llm_output: str) -> list[tuple[str, str]]:
+        """
+        Parse fenced code blocks from LLM output.
+        Returns list of (language, code) tuples.
+        """
+        matches = self._CODE_BLOCK_RE.findall(llm_output)
+        blocks: list[tuple[str, str]] = []
+        for lang, code in matches:
+            lang = (lang or "python").lower().strip()
+            code = code.strip()
+            if code:
+                blocks.append((lang, code))
+        return blocks
+
+    async def execute_code(self, language: str, code: str) -> ExecutionResult:
+        """
+        Execute a code snippet in a sandboxed subprocess.
+        Python code is written to a temp file; JS uses -e flag.
+        """
+        cmd_str = f"[{language}] {len(code)} chars"
+
+        # Shell/bash blocks are not supported in code executor — too risky.
+        if language in ("shell", "bash", "sh"):
+            return ExecutionResult(
+                command=cmd_str,
+                error="Shell execution not supported in code agent. Use Python instead.",
+            )
+
+        interpreter = self._INTERPRETERS.get(language)
+        if not interpreter:
+            return ExecutionResult(
+                command=cmd_str,
+                error=f"Unsupported language: {language}. Use python or javascript.",
+            )
+
+        logger.info("CodeExecutor running %s code (%d chars)", language, len(code))
+
+        try:
+            with tempfile.TemporaryDirectory() as tmp_dir:
+                if language == "python":
+                    # Write code to a temp file and run it.
+                    code_file = Path(tmp_dir) / "script.py"
+                    code_file.write_text(code, encoding="utf-8")
+                    cmd = [*interpreter, str(code_file)]
+                else:
+                    # JS: pass code via -e flag.
+                    cmd = [*interpreter, code]
+
+                proc = await asyncio.create_subprocess_exec(
+                    *cmd,
+                    stdout=asyncio.subprocess.PIPE,
+                    stderr=asyncio.subprocess.PIPE,
+                    cwd=tmp_dir,
+                    env=self._clean_env,
+                )
+
+                try:
+                    stdout_bytes, stderr_bytes = await asyncio.wait_for(
+                        proc.communicate(), timeout=self._timeout,
+                    )
+                except asyncio.TimeoutError:
+                    proc.kill()
+                    await proc.wait()
+                    logger.warning("Code execution timed out after %ds", self._timeout)
+                    return ExecutionResult(
+                        command=cmd_str,
+                        error=f"Timed out after {self._timeout}s",
+                        timeout=True,
+                    )
+
+            stdout = stdout_bytes.decode("utf-8", errors="replace")[:self._output_limit]
+            stderr = stderr_bytes.decode("utf-8", errors="replace")[:self._output_limit]
+
+            logger.info(
+                "Code execution finished: %s — rc=%d, stdout=%d chars",
+                language, proc.returncode, len(stdout),
+            )
+
+            return ExecutionResult(
+                command=cmd_str,
+                stdout=stdout,
+                stderr=stderr,
+                returncode=proc.returncode,
+            )
+
+        except FileNotFoundError:
+            return ExecutionResult(
+                command=cmd_str,
+                error=f"Interpreter not found for {language}. Is it installed?",
+            )
+        except Exception as exc:
+            logger.exception("Unexpected error in code execution")
+            return ExecutionResult(command=cmd_str, error=str(exc))
+
+    async def run_code_loop(
+        self,
+        llm: "LLMClient",
+        agent_profile: "AgentProfile",
+        initial_prompt: str,
+    ) -> str:
+        """
+        The coding agent loop: write code → execute → read output →
+        self-correct/iterate.
+
+        1. Send the task to the LLM.
+        2. Extract code blocks from response.
+        3. Execute each code block.
+        4. If errors, feed output back to the LLM for correction.
+        5. Repeat up to max_iterations.
+        6. Return the final combined output.
+
+        Returns the accumulated output string (conversation-style).
+        """
+        conversation: list[str] = []
+        current_prompt = initial_prompt
+        iteration = 0
+
+        while iteration < self._max_iterations:
+            iteration += 1
+            logger.info(
+                "Code loop iteration %d/%d for agent '%s'",
+                iteration, self._max_iterations, agent_profile.name,
+            )
+
+            # Ask the LLM to write/fix code.
+            llm_response = await llm.generate(
+                prompt=current_prompt,
+                system_prompt=agent_profile.system_prompt,
+                temperature=agent_profile.temperature,
+                model=agent_profile.model,
+                options=agent_profile.options,
+            )
+
+            conversation.append(f"[Iteration {iteration}] Agent response:\n{llm_response}")
+
+            # Extract code blocks.
+            code_blocks = self.extract_code_blocks(llm_response)
+            if not code_blocks:
+                # No code to execute — agent gave a text-only answer; done.
+                logger.info("No code blocks found in iteration %d — finishing loop", iteration)
+                break
+
+            # Execute all code blocks and collect results.
+            all_succeeded = True
+            exec_parts: list[str] = []
+
+            for lang, code in code_blocks:
+                result = await self.execute_code(lang, code)
+                parts = [f"--- {lang} execution ---"]
+                if result.error:
+                    parts.append(f"ERROR: {result.error}")
+                    all_succeeded = False
+                else:
+                    if result.stdout:
+                        parts.append(f"STDOUT:\n{result.stdout}")
+                    if result.stderr:
+                        parts.append(f"STDERR:\n{result.stderr}")
+                    parts.append(f"(exit code: {result.returncode})")
+                    if result.returncode != 0:
+                        all_succeeded = False
+                exec_parts.append("\n".join(parts))
+
+            exec_report = "\n\n".join(exec_parts)
+            conversation.append(
+                f"<|system_output_start|>\n{exec_report}\n<|system_output_end|>"
+            )
+
+            # If all code succeeded, we're done.
+            if all_succeeded:
+                logger.info("All code blocks succeeded in iteration %d", iteration)
+                break
+
+            # Otherwise, feed the error back and ask the LLM to fix it.
+            current_prompt = (
+                f"Your code produced errors. Here is the execution output:\n\n"
+                f"{exec_report}\n\n"
+                f"Please fix the code and try again. "
+                f"Return the corrected code in fenced code blocks."
+            )
+
+        return "\n\n".join(conversation)
+
+
+# ============================================================
 # Pipeline Engine — sequential agent execution
 # ============================================================
 
@@ -607,9 +1018,15 @@ class PipelineEngine:
     real-time progress updates to the user.
     """
 
-    def __init__(self, llm: LLMClient, executor: CommandExecutor | None = None) -> None:
+    def __init__(
+        self,
+        llm: LLMClient,
+        executor: CommandExecutor | None = None,
+        code_executor: CodeExecutor | None = None,
+    ) -> None:
         self._llm = llm
         self._executor = executor
+        self._code_executor = code_executor
 
     async def run(
         self,
@@ -660,13 +1077,22 @@ class PipelineEngine:
                 )
 
             # Call the LLM (lock-protected inside LLMClient).
-            output = await self._llm.generate(
-                prompt=prompt,
-                system_prompt=agent.system_prompt,
-                temperature=agent.temperature,
-                model=agent.model,
-                options=agent.options,
-            )
+            # Coding agents use the iterative code loop instead of a
+            # single LLM call.
+            if agent.can_code and self._code_executor:
+                output = await self._code_executor.run_code_loop(
+                    llm=self._llm,
+                    agent_profile=agent,
+                    initial_prompt=prompt,
+                )
+            else:
+                output = await self._llm.generate(
+                    prompt=prompt,
+                    system_prompt=agent.system_prompt,
+                    temperature=agent.temperature,
+                    model=agent.model,
+                    options=agent.options,
+                )
 
             # If this agent can execute commands and execution is enabled,
             # parse the LLM output for fenced code blocks, run them in the
@@ -932,8 +1358,11 @@ class DashboardServer:
         data = {
             "ollama_online": ollama_ok,
             "model": OLLAMA_MODEL,
+            "default_provider": DEFAULT_PROVIDER,
+            "llm_providers": llm.available_providers(),
             "llm_busy": llm._lock.locked(),
             "code_execution": ENABLE_CODE_EXECUTION,
+            "code_agent": ENABLE_CODE_AGENT,
             "cpu_percent": psutil.cpu_percent(interval=0),
             "ram_total_gb": round(mem.total / (1024**3), 1),
             "ram_used_gb": round(mem.used / (1024**3), 1),
@@ -959,6 +1388,7 @@ class DashboardServer:
                         "role": a.role,
                         "temperature": a.temperature,
                         "can_execute": a.can_execute,
+                        "can_code": a.can_code,
                         "model": a.model or OLLAMA_MODEL,
                     }
                     for a in crew.agents
@@ -1037,6 +1467,7 @@ def is_authorized(username: str | None) -> bool:
 llm: LLMClient
 engine: PipelineEngine
 executor: CommandExecutor | None
+code_executor: CodeExecutor | None
 crew_registry: dict[str, Crew]
 
 
@@ -1091,8 +1522,10 @@ async def cmd_status(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
         "=== NanoCrew-Local Status ===",
         f"Ollama: {'ONLINE' if ollama_ok else 'OFFLINE'}",
         f"Model: {OLLAMA_MODEL}",
+        f"LLM Providers: {', '.join(llm.available_providers())}",
         f"LLM Lock: {lock_status}",
         f"Code execution: {'ENABLED' if ENABLE_CODE_EXECUTION else 'DISABLED'}",
+        f"Code agent: {'ENABLED' if ENABLE_CODE_AGENT else 'DISABLED'}",
         f"RAM: {available_gb:.1f} / {total_gb:.1f} GB available",
         f"RAM usage: {mem.percent}%",
         f"CPU: {psutil.cpu_percent(interval=0.5)}%",
@@ -1314,7 +1747,7 @@ def main() -> None:
         4. Log a hardware report.
         5. Build the Telegram Application and start polling.
     """
-    global llm, engine, executor, crew_registry, dashboard_server
+    global llm, engine, executor, code_executor, crew_registry, dashboard_server
 
     _print_banner()
 
@@ -1339,6 +1772,7 @@ def main() -> None:
 
     # --- Initialize core components ---
     llm = LLMClient(base_url=OLLAMA_BASE_URL, default_model=OLLAMA_MODEL)
+    logger.info("LLM providers available: %s", ", ".join(llm.available_providers()))
 
     # Code execution is opt-in — only create the executor when enabled.
     if ENABLE_CODE_EXECUTION:
@@ -1348,7 +1782,21 @@ def main() -> None:
         executor = None
         logger.info("Code execution DISABLED (set ENABLE_CODE_EXECUTION=true to enable)")
 
-    engine = PipelineEngine(llm, executor=executor)
+    # Coding agent is opt-in — sandboxed Python/JS execution loop.
+    if ENABLE_CODE_AGENT:
+        code_executor = CodeExecutor(
+            timeout=CODE_AGENT_TIMEOUT,
+            max_iterations=CODE_AGENT_MAX_ITERATIONS,
+        )
+        logger.info(
+            "Code agent ENABLED (timeout=%ds, max_iterations=%d)",
+            CODE_AGENT_TIMEOUT, CODE_AGENT_MAX_ITERATIONS,
+        )
+    else:
+        code_executor = None
+        logger.info("Code agent DISABLED (set ENABLE_CODE_AGENT=true to enable)")
+
+    engine = PipelineEngine(llm, executor=executor, code_executor=code_executor)
 
     # --- Load crews ---
     crew_registry = load_crews(CREWS_DIR)

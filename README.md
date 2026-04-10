@@ -7,6 +7,8 @@
   <img alt="Python 3.11+" src="https://img.shields.io/badge/python-3.11+-blue?logo=python&logoColor=white" />
   <img alt="License: AGPL-3.0" src="https://img.shields.io/badge/license-AGPL--3.0-blue" />
   <img alt="Ollama" src="https://img.shields.io/badge/LLM-Ollama-orange?logo=data:image/svg+xml;base64," />
+  <img alt="Claude" src="https://img.shields.io/badge/LLM-Claude-blueviolet" />
+  <img alt="OpenAI" src="https://img.shields.io/badge/LLM-OpenAI--compatible-green" />
   <img alt="Telegram Bot" src="https://img.shields.io/badge/interface-Telegram-26A5E4?logo=telegram&logoColor=white" />
   <img alt="Hardware" src="https://img.shields.io/badge/target-16GB%20RAM%20·%20no%20GPU-critical" />
 </p>
@@ -90,8 +92,8 @@ Drop a YAML file in `crews/` and your new company is live on the next bot restar
 │                                                         │
 │  ┌─────────┐   ┌─────────┐   ┌─────────┐               │
 │  │ Agent 1 │──▶│ Agent 2 │──▶│ Agent N │               │
-│  │ (LLM)   │   │ (LLM +  │   │ (LLM)   │               │
-│  │         │   │  exec?) │   │         │               │
+│  │ (LLM)   │   │ (code   │   │ (LLM)   │               │
+│  │         │   │  loop?) │   │         │               │
 │  └─────────┘   └─────────┘   └─────────┘               │
 │       │             │             │                      │
 │       └─────────────┴─────────────┘                      │
@@ -100,33 +102,38 @@ Drop a YAML file in `crews/` and your new company is live on the next bot restar
                        │  one request at a time
                        ▼
 ┌─────────────────────────────────────────────────────────┐
-│              Ollama (Local LLM)                          │
-│         http://localhost:11434                           │
-│         default model: gemma4:4b                        │
+│              Multi-Provider LLM                          │
+│                                                         │
+│  ┌──────────┐  ┌───────────┐  ┌──────────────────┐     │
+│  │  Ollama  │  │  Claude   │  │ OpenAI-compatible │     │
+│  │  (local) │  │  (API)    │  │ (OpenAI/Groq/...)│     │
+│  └──────────┘  └───────────┘  └──────────────────┘     │
 │                                                         │
 │         asyncio.Lock guarantees single                  │
 │         inference — never OOM on 16 GB                  │
 └─────────────────────────────────────────────────────────┘
 ```
 
-**Key Innovation: Time-Shared LLM Access.** An `asyncio.Lock` inside the LLM client guarantees that only **one** Ollama inference runs at a time, across all users and all agents. No concurrent model loads, no RAM spikes, no OOM kills. Agents execute strictly sequentially — each one's output becomes the next one's input.
+**Key Innovation: Time-Shared LLM Access.** An `asyncio.Lock` inside the LLM client guarantees that only **one** inference runs at a time, across all providers, users, and agents. No concurrent model loads, no RAM spikes, no OOM kills. Agents execute strictly sequentially — each one's output becomes the next one's input.
 
 ---
 
 ## Features
 
-| Feature                      | Details                                                                          |
-| ---------------------------- | -------------------------------------------------------------------------------- |
-| **YAML-Driven Crews**        | Define agent teams as drop-in `.yaml` files in `crews/`. No code changes needed. |
-| **Time-Shared LLM**          | `asyncio.Lock` ensures single-inference execution — safe on 16 GB RAM.           |
-| **Hardware Awareness**       | Pre-flight RAM checks warn you before a pipeline exceeds available memory.       |
-| **Sandboxed Code Execution** | Agents can run whitelisted system commands (opt-in, read-only, audited).         |
-| **Telegram Interface**       | Full bot with `/scan`, `/crew list`, `/crew info`, `/crew run`, `/status`.       |
+| Feature                      | Details                                                                                             |
+| ---------------------------- | --------------------------------------------------------------------------------------------------- |
+| **YAML-Driven Crews**        | Define agent teams as drop-in `.yaml` files in `crews/`. No code changes needed.                    |
+| **Multi-Provider LLM**       | Ollama (local), Claude API, OpenAI-compatible (Groq, Together, vLLM). Per-agent model override.     |
+| **Time-Shared LLM**          | `asyncio.Lock` ensures single-inference execution — safe on 16 GB RAM.                              |
+| **Coding Agent Loop**        | Agents with `can_code: true` write code → execute → read output → self-correct (up to N iterations).|
+| **Hardware Awareness**       | Pre-flight RAM checks warn you before a pipeline exceeds available memory.                          |
+| **Sandboxed Code Execution** | Agents can run whitelisted system commands (opt-in, read-only, audited).                            |
+| **Telegram Interface**       | Full bot with `/scan`, `/crew list`, `/crew info`, `/crew run`, `/status`.                          |
 | **Live Dashboard**           | Local web UI at `http://127.0.0.1:8585` — real-time agent activity, system metrics, AI suggestions. |
-| **Whitelist Auth**           | Only approved Telegram usernames can issue commands. Fail-closed.                |
-| **OS Auto-Detection**        | Command whitelists adapt to Linux or Windows automatically.                      |
-| **Single-File Core**         | All logic in one `core_orchestrator.py`. Clone and run.                          |
-| **Ultra-Light Deps**         | 5 packages: `python-telegram-bot`, `python-dotenv`, `psutil`, `pyyaml`, `aiohttp`. |
+| **Whitelist Auth**           | Only approved Telegram usernames can issue commands. Fail-closed.                                   |
+| **OS Auto-Detection**        | Command whitelists adapt to Linux or Windows automatically.                                         |
+| **Single-File Core**         | All logic in one `core_orchestrator.py`. Clone and run.                                             |
+| **Ultra-Light Deps**         | 5 packages: `python-telegram-bot`, `python-dotenv`, `psutil`, `pyyaml`, `aiohttp`.                  |
 
 ---
 
@@ -205,13 +212,13 @@ NanoCrew-Local ships with a **local web dashboard** that launches automatically 
 
 ### What You See
 
-| Panel              | Description                                                                    |
-| ------------------ | ------------------------------------------------------------------------------ |
-| **System Resources** | Real-time CPU, RAM, and disk usage with color-coded progress bars             |
-| **Ollama Status**  | Model name, online/offline status, LLM lock state, code execution toggle       |
-| **Companies**      | All loaded crews with their agents — active agents glow green during pipelines |
-| **Live Activity**  | Timestamped feed of agent starts and completions, streamed via WebSocket        |
-| **AI Suggestions** | One-click button asks your LLM to analyze your setup and suggest improvements  |
+| Panel                | Description                                                                    |
+| -------------------- | ------------------------------------------------------------------------------ |
+| **System Resources** | Real-time CPU, RAM, and disk usage with color-coded progress bars              |
+| **Ollama Status**    | Model name, online/offline status, LLM lock state, code execution toggle       |
+| **Companies**        | All loaded crews with their agents — active agents glow green during pipelines |
+| **Live Activity**    | Timestamped feed of agent starts and completions, streamed via WebSocket       |
+| **AI Suggestions**   | One-click button asks your LLM to analyze your setup and suggest improvements  |
 
 ### Configuration
 
@@ -305,6 +312,115 @@ Code execution is **opt-in** and **defense-in-depth**:
 
 ---
 
+## Multi-Provider LLM
+
+NanoCrew-Local defaults to **Ollama** (free, local, private) but can route agent requests to **Claude** or any **OpenAI-compatible** endpoint.
+
+### Setup
+
+Add API keys to your `.env`:
+
+```ini
+# Anthropic Claude
+ANTHROPIC_API_KEY=sk-ant-...
+
+# OpenAI / Groq / Together / local vLLM
+OPENAI_API_KEY=sk-...
+OPENAI_BASE_URL=https://api.openai.com/v1   # Change for other providers
+```
+
+### Per-Agent Model Override
+
+In any crew YAML, set `model:` with a provider prefix:
+
+```yaml
+agents:
+  - name: "Strategist"
+    model: claude:claude-sonnet-4-20250514   # Uses Claude API
+    # model: openai:gpt-4o              # Uses OpenAI-compatible API
+    # model: ollama:gemma4:4b            # Explicit Ollama (same as default)
+    # model: gemma4:4b                   # No prefix → uses DEFAULT_PROVIDER
+```
+
+### Mixing Providers in One Crew
+
+```yaml
+agents:
+  - name: "Planner"
+    model: claude:claude-sonnet-4-20250514   # Cloud for complex reasoning
+    role: "Plan the approach"
+    system_prompt: "..."
+
+  - name: "Executor"
+    model: ollama:gemma4:4b        # Local for fast, simple tasks
+    role: "Execute the plan"
+    system_prompt: "..."
+```
+
+The `asyncio.Lock` applies across all providers — only one inference at a time, regardless of backend. This keeps RAM safe when mixing local and cloud models.
+
+---
+
+## Coding Agent
+
+The **coding agent loop** lets agents write code, execute it in a sandbox, read the output, and self-correct — like Claude Code or Open Interpreter, but integrated into your crew pipeline.
+
+### Enabling
+
+```ini
+# In .env
+ENABLE_CODE_AGENT=true
+CODE_AGENT_MAX_ITERATIONS=5    # Max write-execute-fix cycles
+CODE_AGENT_TIMEOUT=60          # Seconds per execution
+```
+
+Then set `can_code: true` on the relevant agent(s) in your crew YAML:
+
+```yaml
+agents:
+  - name: "Coder"
+    can_code: true
+    role: "Write and execute code"
+    system_prompt: "Write code in ```python blocks..."
+    temperature: 0.2
+```
+
+### How It Works
+
+1. Agent receives the task (or previous agent's output)
+2. LLM generates a response with fenced code blocks
+3. Code is extracted and executed in a sandboxed subprocess
+4. If execution fails, errors are fed back to the LLM
+5. LLM fixes the code and tries again (up to `CODE_AGENT_MAX_ITERATIONS`)
+6. Final output (conversation + execution results) passes to the next agent
+
+### Security Model
+
+| Layer                    | Protection                                                       |
+| ------------------------ | ---------------------------------------------------------------- |
+| **Global kill switch**   | `ENABLE_CODE_AGENT=false` disables all code execution            |
+| **Per-agent flag**       | Only agents with `can_code: true` enter the code loop            |
+| **Temp working dir**     | Code runs in a disposable temp directory                         |
+| **Clean environment**    | No `.env` secrets leaked to subprocesses                         |
+| **Timeout**              | Hard kill after `CODE_AGENT_TIMEOUT` seconds                     |
+| **Output cap**           | Subprocess output truncated at 10 KB                             |
+| **No shell mode**        | Python/Node exec'd directly — no shell metacharacter expansion   |
+| **Iteration cap**        | Loop stops after `CODE_AGENT_MAX_ITERATIONS` (prevents runaway)  |
+
+### Included Crew: Dev Team
+
+The `dev_team.yaml` crew ships by default with three agents:
+
+- **Architect** — breaks the problem into a detailed implementation plan
+- **Coder** (`can_code: true`) — writes and executes code, self-corrects on errors
+- **Reviewer** — reviews the code for correctness, security, and style
+
+```
+/crew run dev_team write a Python script that finds duplicate files by hash
+```
+
+---
+
 ## Hardware Requirements
 
 | Component   | Minimum                   | Recommended                 |
@@ -343,6 +459,7 @@ nanocrew-local/
     ├── startup_team.yaml      # Example: tech startup team
     ├── customer_support.yaml  # Example: customer support pipeline
     ├── content_studio.yaml    # Example: content creation studio
+    ├── dev_team.yaml          # Example: coding agent crew (Architect → Coder → Reviewer)
     ├── finance_team.yaml      # Example: finance team
     ├── legal_review.yaml      # Example: legal review crew
     └── health_wellness.yaml   # Example: health & wellness crew
